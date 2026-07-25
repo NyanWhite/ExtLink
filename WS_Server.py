@@ -1,13 +1,11 @@
-# ws_server.py
-# 支持Gzip压缩数据的WebSocket服务器
+﻿# ws_server.py
+# 修复版 - 去掉3D显示，传感器数据全量展示
 
 import asyncio
 import json
 import logging
 import time
 import os
-import gzip
-import base64
 from datetime import datetime
 from typing import Dict, Any, Optional
 import websockets
@@ -58,62 +56,6 @@ except Exception as e:
     DATA_DIR = "."
 
 
-# ==================== 压缩/解压工具 ====================
-def decompress_data(encoded_str: str) -> Optional[Dict[str, Any]]:
-    """
-    解压从AutoJS发送来的Gzip压缩数据
-    
-    Args:
-        encoded_str: Base64编码的Gzip压缩字符串
-    
-    Returns:
-        解压后的JSON数据，失败返回None
-    """
-    try:
-        # Base64解码
-        compressed_bytes = base64.b64decode(encoded_str)
-        # Gzip解压
-        decompressed_bytes = gzip.decompress(compressed_bytes)
-        # 解析JSON
-        return json.loads(decompressed_bytes.decode('utf-8'))
-    except Exception as e:
-        logger.error(f"❌ 解压数据失败: {e}")
-        return None
-
-
-def compress_data(data: Dict[str, Any]) -> Optional[str]:
-    """
-    压缩数据（用于发送给AutoJS）
-    
-    Args:
-        data: 要压缩的数据对象
-    
-    Returns:
-        Base64编码的压缩字符串，失败返回None
-    """
-    try:
-        json_str = json.dumps(data, ensure_ascii=False)
-        # Gzip压缩
-        compressed = gzip.compress(json_str.encode('utf-8'))
-        # Base64编码
-        return base64.b64encode(compressed).decode('utf-8')
-    except Exception as e:
-        logger.error(f"❌ 压缩数据失败: {e}")
-        return None
-
-
-def is_compressed_data(message: str) -> bool:
-    """
-    检测消息是否为压缩数据
-    压缩数据通常以 'H4sI' 开头（Gzip Base64的特征）
-    """
-    if not isinstance(message, str) or len(message) < 4:
-        return False
-    # Gzip Base64 通常以 H4sI 开头
-    return message.startswith('H4sI') and len(message) > 20
-
-
-# ==================== 服务器类 ====================
 class DeviceDataServer:
     def __init__(self):
         self.clients: Dict[str, websockets.WebSocketServerProtocol] = {}
@@ -121,10 +63,7 @@ class DeviceDataServer:
         self.device_last_seen: Dict[str, float] = {}
         self.device_info: Dict[str, Dict] = {}
         self.total_messages = 0
-        self.total_compressed = 0
-        self.total_uncompressed = 0
         self.running = False
-        self.stats_history = []
         
     async def start(self):
         self.running = True
@@ -147,60 +86,32 @@ class DeviceDataServer:
 
         try:
             message = await websocket.recv()
-            
-            # ===== 尝试解压数据 =====
-            data = None
-            is_compressed = False
-            
-            if is_compressed_data(message):
-                # 消息是压缩格式
-                logger.info(f"📦 收到压缩数据，尝试解压...")
-                data = decompress_data(message)
-                if data is not None:
-                    is_compressed = True
-                    self.total_compressed += 1
-                    logger.info(f"✅ 解压成功")
-                else:
-                    logger.warning(f"⚠️ 解压失败，尝试作为JSON解析")
-            
-            # 如果解压失败或不是压缩数据，尝试JSON解析
-            if data is None:
-                try:
-                    data = json.loads(message)
-                    is_compressed = False
-                    self.total_uncompressed += 1
-                except json.JSONDecodeError:
-                    logger.warning(f"⚠️ 客户端发送了无效数据")
-                    return
-            
-            # ===== 处理数据 =====
-            client_id = data.get('deviceId', str(id(websocket)))
-            
-            if client_id not in self.device_info:
-                self.device_info[client_id] = {
-                    "first_seen": datetime.now().isoformat(),
-                    "device_model": data.get('device', {}).get('model', 'Unknown'),
-                    "device_manufacturer": data.get('device', {}).get('manufacturer', 'Unknown'),
-                    "compression_enabled": is_compressed
-                }
-                logger.info(f"📱 新设备 {client_id} 连接成功 (压缩: {is_compressed})")
-            else:
-                self.device_info[client_id]["last_update"] = datetime.now().isoformat()
-                self.device_info[client_id]["compression_enabled"] = is_compressed
+            try:
+                data = json.loads(message)
+                client_id = data.get('deviceId', str(id(websocket)))
+
+                if client_id not in self.device_info:
+                    self.device_info[client_id] = {
+                        "first_seen": datetime.now().isoformat(),
+                        "device_model": data.get('device', {}).get('model', 'Unknown'),
+                        "device_manufacturer": data.get('device', {}).get('manufacturer', 'Unknown'),
+                    }
+
+                logger.info(f"📱 设备 {client_id} 连接成功")
+            except json.JSONDecodeError:
+                client_id = str(id(websocket))
+                logger.warning(f"客户端 {client_id} 发送了无效的JSON")
+                return
 
             self.clients[client_id] = websocket
             self.device_last_seen[client_id] = time.time()
-            self.device_data[client_id] = data
 
-            # 发送欢迎消息
             await websocket.send(json.dumps({
                 "type": "welcome",
                 "timestamp": int(time.time() * 1000),
-                "message": "连接成功! 等待数据接收...",
-                "compression": "supported"
+                "message": "连接成功! 等待数据接收..."
             }))
 
-            # 处理后续消息
             async for message in websocket:
                 await self.process_message(client_id, message)
 
@@ -216,32 +127,13 @@ class DeviceDataServer:
 
     async def process_message(self, client_id: str, message: str):
         try:
-            # ===== 尝试解压 =====
-            data = None
-            is_compressed = False
-            
-            if is_compressed_data(message):
-                data = decompress_data(message)
-                if data is not None:
-                    is_compressed = True
-                    self.total_compressed += 1
-            
-            if data is None:
-                try:
-                    data = json.loads(message)
-                    is_compressed = False
-                    self.total_uncompressed += 1
-                except json.JSONDecodeError:
-                    logger.error(f"❌ JSON解析失败")
-                    return
-
+            data = json.loads(message)
             data_type = data.get('dataType', 'unknown')
             self.total_messages += 1
 
             self.device_last_seen[client_id] = time.time()
             self.device_data[client_id] = data
 
-            # 更新设备信息
             if 'device' in data:
                 self.device_info[client_id] = {
                     "first_seen": self.device_info.get(client_id, {}).get("first_seen", datetime.now().isoformat()),
@@ -249,33 +141,26 @@ class DeviceDataServer:
                     "device_manufacturer": data['device'].get('manufacturer', 'Unknown'),
                     "screen_width": data['device'].get('screenWidth', 1080),
                     "screen_height": data['device'].get('screenHeight', 2400),
-                    "last_update": datetime.now().isoformat(),
-                    "compression_enabled": is_compressed
+                    "last_update": datetime.now().isoformat()
                 }
 
-            # 保存数据到文件
             self.save_data_to_file(client_id, data)
 
-            # 处理不同类型的数据
             if data_type == 'full':
                 await self.handle_full_data(client_id, data)
             elif data_type == 'diff':
                 await self.handle_partial_data(client_id, data)
-            
-            # 记录压缩统计
-            if self.total_messages % 50 == 0:
-                logger.info(f"📊 统计: 压缩={self.total_compressed}, 未压缩={self.total_uncompressed}")
 
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON解析错误: {e}")
         except Exception as e:
-            logger.error(f"❌ 处理消息时出错: {e}")
+            logger.error(f"处理消息时出错: {e}")
 
     async def handle_full_data(self, client_id: str, data: Dict[str, Any]):
-        # 静默处理完整数据
-        pass
+        logger.info(f"📥 收到设备 {client_id} 的完整数据")
 
     async def handle_partial_data(self, client_id: str, data: Dict[str, Any]):
-        # 静默处理增量数据
-        pass
+        logger.info(f"📥 收到设备 {client_id} 的增量数据")
 
     def save_data_to_file(self, client_id: str, data: Dict[str, Any]):
         try:
@@ -292,20 +177,17 @@ class DeviceDataServer:
             "total_clients": len(self.clients),
             "active_devices": len([c for c, t in self.device_last_seen.items() if now - t < 300]),
             "total_messages": self.total_messages,
-            "total_compressed": self.total_compressed,
-            "total_uncompressed": self.total_uncompressed,
-            "compression_ratio": 0,
             "devices": {}
         }
-        
-        if self.total_messages > 0:
-            stats["compression_ratio"] = round(self.total_compressed / self.total_messages * 100, 1)
 
         for client_id, data in self.device_data.items():
             last_seen = self.device_last_seen.get(client_id, 0)
             info = self.device_info.get(client_id, {})
+            # 从数据中提取timestamp
+            data_timestamp = data.get('timestamp', 0)
             stats["devices"][client_id] = {
                 "last_seen": datetime.fromtimestamp(last_seen).isoformat() if last_seen else None,
+                "data_timestamp": data_timestamp,  # 添加数据时间戳
                 "data_fields": len(data),
                 "has_battery": 'battery' in data,
                 "has_foreground": 'foreground' in data,
@@ -316,8 +198,7 @@ class DeviceDataServer:
                 "device_manufacturer": info.get('device_manufacturer', 'Unknown'),
                 "screen_width": info.get('screen_width', 1080),
                 "screen_height": info.get('screen_height', 2400),
-                "first_seen": info.get('first_seen', 'Unknown'),
-                "compression_enabled": info.get('compression_enabled', False)
+                "first_seen": info.get('first_seen', 'Unknown')
             }
 
         return stats
@@ -348,12 +229,10 @@ HTML_PAGE = """
         }
         .header h1 { font-size: 24px; font-weight: 600; }
         .header h1 span { color: #00d4ff; }
-        .header .stats-info { display: flex; gap: 20px; flex-wrap: wrap; }
+        .header .stats-info { display: flex; gap: 30px; flex-wrap: wrap; }
         .header .stats-info .stat-item { text-align: center; }
-        .header .stats-info .stat-item .num { font-size: 24px; font-weight: 700; color: #00d4ff; }
-        .header .stats-info .stat-item .num.green { color: #00ff88; }
-        .header .stats-info .stat-item .num.yellow { color: #ffaa00; }
-        .header .stats-info .stat-item .label { font-size: 11px; color: #8899aa; }
+        .header .stats-info .stat-item .num { font-size: 28px; font-weight: 700; color: #00d4ff; }
+        .header .stats-info .stat-item .label { font-size: 12px; color: #8899aa; }
         
         .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
         @media (max-width: 1200px) { .grid { grid-template-columns: 1fr; } }
@@ -367,7 +246,6 @@ HTML_PAGE = """
         }
         .card:hover { border-color: rgba(100, 200, 255, 0.2); }
         .card.offline { opacity: 0.5; }
-        .card.compressed { border-color: rgba(0, 255, 136, 0.3); }
         
         .card-header {
             padding: 15px 20px;
@@ -401,14 +279,6 @@ HTML_PAGE = """
         .card-header .device-status .dot.offline { background: #ff4444; }
         .card-header .toggle-icon { font-size: 18px; transition: transform 0.3s; display: inline-block; }
         .card-header .toggle-icon.open { transform: rotate(180deg); }
-        .card-header .compress-badge {
-            font-size: 10px;
-            padding: 2px 10px;
-            border-radius: 12px;
-            background: rgba(0, 255, 136, 0.15);
-            color: #00ff88;
-            font-weight: 600;
-        }
         
         .card-body { display: none; padding: 20px; }
         .card-body.open { display: block; }
@@ -501,15 +371,34 @@ HTML_PAGE = """
             text-align: center;
             padding: 30px 0;
         }
+        
+        .card-footer {
+            padding: 10px 20px;
+            background: rgba(0, 0, 0, 0.15);
+            border-top: 1px solid rgba(100, 200, 255, 0.05);
+            font-size: 12px;
+            color: #556677;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .card-footer .update-time {
+            color: #8899aa;
+        }
+        .card-footer .update-time .time-value {
+            color: #00d4ff;
+            font-family: monospace;
+        }
     </style>
 </head>
 <body>
 <div class="container">
     <div class="header">
         <div>
-            <h1>📱 <span>Device</span>Monitor</h1>
+            <h1><span>Ext</span>Link</h1>
             <div style="font-size:13px;color:#8899aa;margin-top:4px;">
-                实时设备数据监控
             </div>
         </div>
         <div class="stats-info">
@@ -518,8 +407,8 @@ HTML_PAGE = """
                 <div class="label">在线设备</div>
             </div>
             <div class="stat-item">
-                <div class="num" id="lastUpdate">-</div>
-                <div class="label">最后更新</div>
+                <div class="num" id="totalMessages">0</div>
+                <div class="label">数据包</div>
             </div>
         </div>
     </div>
@@ -527,7 +416,6 @@ HTML_PAGE = """
     <div class="grid" id="devicesContainer">
         <div class="full-width empty-state">
             <div class="icon">📡</div>
-            <p>等待设备连接...</p>
         </div>
     </div>
 </div>
@@ -535,7 +423,7 @@ HTML_PAGE = """
 <script>
     // ==================== 状态管理 ====================
     var deviceDataCache = {};
-    var deviceStats = { total_clients: 0, total_messages: 0, total_compressed: 0, total_uncompressed: 0 };
+    var deviceStats = { total_clients: 0, total_messages: 0 };
     var cardStates = {};
     var isUpdating = false;
     var pendingUpdate = false;
@@ -559,7 +447,7 @@ HTML_PAGE = """
         'battery': '电池'
     };
 
-    // ==================== 格式化传感器值 ====================
+    // ==================== 格式化工具 ====================
     function formatSensorValue(val) {
         if (val === undefined || val === null) return 'N/A';
         if (typeof val === 'object') {
@@ -587,6 +475,25 @@ HTML_PAGE = """
         }
         return '';
     }
+    
+    // 格式化时间戳（毫秒转本地时间）
+    function formatTimestamp(ts) {
+        if (!ts || ts <= 0) return '未知';
+        try {
+            var d = new Date(ts);
+            if (isNaN(d.getTime())) return '无效时间';
+            return d.toLocaleString('zh-CN', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+        } catch (e) {
+            return '无效时间';
+        }
+    }
 
     // ==================== UI渲染 ====================
     function renderDevices(data) {
@@ -599,7 +506,6 @@ HTML_PAGE = """
             container.innerHTML = `
                 <div class="full-width empty-state">
                     <div class="icon">📡</div>
-                    <p>等待设备连接...</p>
                 </div>
             `;
             return;
@@ -611,7 +517,6 @@ HTML_PAGE = """
             var dev = data.devices[clientId];
             var detail = deviceDataCache[clientId] || {};
             var isOnline = dev.last_seen !== null;
-            var isCompressed = dev.compression_enabled || false;
 
             var battery = detail.battery || {};
             var batteryLevel = battery.level !== undefined ? battery.level : '?';
@@ -648,6 +553,10 @@ HTML_PAGE = """
             var deviceManufacturer = dev.device_manufacturer || '';
             var screenWidth = dev.screen_width || 1080;
             var screenHeight = dev.screen_height || 2400;
+            
+            // 获取数据时间戳
+            var dataTimestamp = dev.data_timestamp || 0;
+            var updateTimeStr = formatTimestamp(dataTimestamp);
 
             var safeId = clientId.replace(/[^a-zA-Z0-9]/g, '_');
             var bodyId = 'body-' + safeId;
@@ -655,8 +564,6 @@ HTML_PAGE = """
 
             var isOpen = cardStates[clientId] || false;
             var toggleClass = isOpen ? 'open' : '';
-            var compressedClass = isCompressed ? 'compressed' : '';
-            var compressBadge = isCompressed ? '<span class="compress-badge">📦 压缩</span>' : '';
 
             // ===== 构建传感器列表 =====
             var sensorKeys = Object.keys(sensors);
@@ -700,13 +607,12 @@ HTML_PAGE = """
             var sensorCount = sortedKeys.length;
 
             html += `
-            <div class="card ${isOnline ? '' : 'offline'} ${compressedClass}" id="${cardId}">
+            <div class="card ${isOnline ? '' : 'offline'}" id="${cardId}">
                 <div class="card-header" onclick="toggleCard('${bodyId}', '${clientId}')">
                     <div class="device-name">
                         <span class="model">${deviceModel}</span>
                         <span style="font-size:13px;color:#8899aa;margin-left:8px;">${deviceManufacturer}</span>
                         <span style="font-size:12px;color:#556677;margin-left:8px;">${screenWidth}×${screenHeight}</span>
-                        ${compressBadge}
                     </div>
                     <div class="device-status">
                         <span>🔋 ${batteryLevel}%</span>
@@ -740,7 +646,6 @@ HTML_PAGE = """
                                 <div class="data-item">
                                     <div class="label">📱 前台应用</div>
                                     <div class="value" style="font-size:13px;">${fgName}</div>
-                                    <div class="sub">来源: ${foreground.source || 'unknown'}</div>
                                 </div>
                                 <div class="data-item">
                                     <div class="label">🖥️ 屏幕</div>
@@ -766,6 +671,10 @@ HTML_PAGE = """
                             </div>
                         </div>
                     </div>
+                </div>
+                <div class="card-footer">
+                    <span class="update-time">🕐 数据更新: <span class="time-value">${updateTimeStr}</span></span>
+                    <span>📊 权限等级: ${dev.permission_level || 'unknown'}</span>
                 </div>
             </div>
             `;
@@ -807,9 +716,6 @@ HTML_PAGE = """
                 deviceStats = data;
                 document.getElementById('totalClients').textContent = data.total_clients || 0;
                 document.getElementById('totalMessages').textContent = data.total_messages || 0;
-                document.getElementById('compressedCount').textContent = data.total_compressed || 0;
-                document.getElementById('uncompressedCount').textContent = data.total_uncompressed || 0;
-                document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
 
                 var currentStates = {};
                 for (var id in cardStates) {
@@ -898,12 +804,11 @@ async def main():
     host = CONFIG.get("host", "0.0.0.0")
 
     logger.info("=" * 80)
-    logger.info("📱 设备数据接收服务器 v7.0 (支持Gzip压缩)")
+    logger.info("📱 设备数据接收服务器 v7.0")
     logger.info("=" * 80)
     logger.info(f"🌐 WebSocket: ws://{host}:{ws_port}")
     logger.info(f"🌐 Web界面: http://{host}:{web_port}")
     logger.info(f"📁 数据目录: {DATA_DIR}")
-    logger.info(f"📦 压缩支持: ✅ Gzip + Base64")
     logger.info("📝 配置文件: server_config.json")
     logger.info("=" * 80)
 

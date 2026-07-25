@@ -1,5 +1,5 @@
 // device_collector.js
-// 支持Gzip压缩的AutoJS设备数据采集脚本
+// 修复版 - 传感器数据更新频率可配置 + 前台应用获取修复
 
 "auto";
 
@@ -106,91 +106,6 @@ function getScreenInfo() {
     }
 }
 
-// ==================== Gzip压缩工具 ====================
-function strToBytes(str) {
-    return new java.lang.String(str).getBytes("UTF-8");
-}
-
-function bytesToStr(bytes) {
-    return new java.lang.String(bytes, "UTF-8");
-}
-
-/**
- * 压缩数据
- * @param {Object} data - 要压缩的数据对象
- * @returns {string} Base64编码的压缩字符串
- */
-function compressData(data) {
-    try {
-        const jsonStr = JSON.stringify(data);
-        const bytes = strToBytes(jsonStr);
-        
-        const baos = new java.io.ByteArrayOutputStream();
-        const gzip = new java.util.zip.GZIPOutputStream(baos);
-        gzip.write(bytes);
-        gzip.close();
-        
-        const compressedBytes = baos.toByteArray();
-        const encoded = android.util.Base64.encodeToString(
-            compressedBytes,
-            android.util.Base64.NO_WRAP
-        );
-        
-        return encoded;
-    } catch (e) {
-        console.error("压缩失败:", e);
-        return null;
-    }
-}
-
-/**
- * 解压数据
- * @param {string} encodedStr - Base64编码的压缩字符串
- * @returns {Object} 解压后的数据对象
- */
-function decompressData(encodedStr) {
-    try {
-        const compressedBytes = android.util.Base64.decode(
-            encodedStr,
-            android.util.Base64.DEFAULT
-        );
-        
-        const bais = new java.io.ByteArrayInputStream(compressedBytes);
-        const gzip = new java.util.zip.GZIPInputStream(bais);
-        const reader = new java.io.BufferedReader(
-            new java.io.InputStreamReader(gzip, "UTF-8")
-        );
-        
-        let result = "";
-        let line;
-        while ((line = reader.readLine()) !== null) {
-            result += line;
-        }
-        reader.close();
-        
-        return JSON.parse(result);
-    } catch (e) {
-        console.error("解压失败:", e);
-        return null;
-    }
-}
-
-/**
- * 测试压缩功能是否可用
- */
-function testCompression() {
-    try {
-        var testData = { test: "hello", number: 123, time: Date.now() };
-        var compressed = compressData(testData);
-        if (!compressed) return false;
-        var decompressed = decompressData(compressed);
-        if (!decompressed) return false;
-        return JSON.stringify(decompressed) === JSON.stringify(testData);
-    } catch (e) {
-        return false;
-    }
-}
-
 // ==================== 配置 ====================
 var DEVICE_ID = getDeviceId();
 var MARKET_NAME = getMarketName();
@@ -199,18 +114,10 @@ var ANDROID_VERSION = getAndroidVersion();
 var SDK_VERSION = getSdkVersion();
 var SCREEN_INFO = getScreenInfo();
 
-// 测试压缩功能
-var COMPRESSION_ENABLED = testCompression();
-if (COMPRESSION_ENABLED) {
-    log("✅ Gzip压缩功能已启用");
-} else {
-    log("⚠️ Gzip压缩功能不可用，将使用明文传输");
-}
-
 var CONFIG = {
     "deviceId": DEVICE_ID,
-    "wsServer": "",
-    "updateInterval": 5,
+    "wsServer": "localhost:114514",
+    "updateInterval": 5,  // 数据上传间隔（秒）
     "collectBasicInfo": true,
     "collectBattery": true,
     "collectForegroundApp": true,
@@ -221,8 +128,7 @@ var CONFIG = {
     "collectLocation": true,
     "collectSensor": true,
     "collectProcesses": true,
-    "collectPackages": true,
-    "compressionEnabled": COMPRESSION_ENABLED
+    "collectPackages": true
 };
 
 // ==================== 打印设备信息 ====================
@@ -237,7 +143,6 @@ log("🏭 制造商: " + MANUFACTURER);
 log("📦 Android版本: " + ANDROID_VERSION + " (SDK " + SDK_VERSION + ")");
 log("📐 屏幕: " + SCREEN_INFO.width + "x" + SCREEN_INFO.height);
 log("⏱️ 上传间隔: " + CONFIG.updateInterval + "秒");
-log("📦 压缩: " + (COMPRESSION_ENABLED ? "✅ 启用" : "❌ 禁用"));
 log("=".repeat(60));
 
 // ==================== 状态变量 ====================
@@ -245,8 +150,9 @@ var ws = null;
 var wsConnected = false;
 var isRunning = true;
 var sendCount = 0;
+var heartbeatCount = 0;
 
-// 传感器数据缓存
+// 传感器数据缓存（用于高频采样）
 var sensorCache = {
     accelerometer: null,
     gyroscope: null,
@@ -262,6 +168,7 @@ var sensorCache = {
     _lastUpdate: 0
 };
 
+// 传感器监听器（持续采集）
 var sensorListeners = [];
 
 // ==================== 权限检测 ====================
@@ -305,52 +212,130 @@ function execShell(cmd) {
     }
 }
 
-// ==================== 获取前台应用 ====================
+// ==================== 获取前台应用（增强版） ====================
 function getForegroundApp() {
     var pkg = "Unknown";
     var act = "Unknown";
     var source = "none";
 
+    // 方法1: 使用 Auto.js 原生 API (需要无障碍服务)
     if (auto.service) {
         try {
-            if (typeof app.currentPackage === 'function') {
-                var p = app.currentPackage();
-                if (p && p !== "Unknown" && p.length > 0) {
+            // 尝试使用 currentPackage()
+            if (typeof currentPackage === 'function') {
+                var p = currentPackage();
+                if (p && p !== "Unknown" && p !== "" && p !== null && typeof p === 'string' && p.length > 0) {
                     pkg = p;
-                    source = "autojs";
+                    source = "autojs_currentPackage";
                 }
             }
-        } catch (e) {}
+        } catch (e) {
+            log("⚠️ currentPackage() 调用失败: " + e.message);
+        }
 
+        // 如果 currentPackage 失败，尝试使用 app.currentPackage()
+        if (pkg === "Unknown") {
+            try {
+                if (typeof app.currentPackage === 'function') {
+                    var p = app.currentPackage();
+                    if (p && p !== "Unknown" && p !== "" && p !== null && typeof p === 'string' && p.length > 0) {
+                        pkg = p;
+                        source = "autojs_app_currentPackage";
+                    }
+                }
+            } catch (e) {
+                // 静默处理
+            }
+        }
+
+        // 获取 Activity
         try {
-            if (typeof app.currentActivity === 'function') {
-                var a = app.currentActivity();
-                if (a && a !== "Unknown" && a.length > 0) {
+            if (typeof currentActivity === 'function') {
+                var a = currentActivity();
+                if (a && a !== "Unknown" && a !== "" && a !== null && typeof a === 'string' && a.length > 0) {
                     act = a;
                 }
             }
         } catch (e) {}
-    }
 
-    if (pkg === "Unknown") {
-        var cmds = [
-            "dumpsys window windows | grep -E 'mCurrentFocus' | head -1",
-            "dumpsys activity activities | grep -E 'mResumedActivity' | head -1"
-        ];
-        for (var i = 0; i < cmds.length; i++) {
+        if (act === "Unknown") {
             try {
-                var cmd = execShell(cmds[i]);
-                if (cmd) {
-                    var match = cmd.match(/([^\s]+)\/([^\s]+)/);
-                    if (match) {
-                        pkg = match[1];
-                        act = match[2] || "Unknown";
-                        source = "dumpsys";
-                        break;
+                if (typeof app.currentActivity === 'function') {
+                    var a = app.currentActivity();
+                    if (a && a !== "Unknown" && a !== "" && a !== null && typeof a === 'string' && a.length > 0) {
+                        act = a;
                     }
                 }
             } catch (e) {}
         }
+    }
+
+    // 方法2: 使用 dumpsys (不需要无障碍, 但需要权限)
+    if (pkg === "Unknown") {
+        // 多个 dumpsys 命令尝试
+        var cmds = [
+            // Android 8+ 推荐
+            "dumpsys activity activities 2>/dev/null | grep -E 'mResumedActivity|mFocusedActivity|mCurrentFocus' | head -1",
+            // 旧版本兼容
+            "dumpsys window windows 2>/dev/null | grep -E 'mCurrentFocus' | head -1",
+            // 备用方法
+            "dumpsys activity top 2>/dev/null | grep -E 'ACTIVITY|TASK' | head -5"
+        ];
+
+        for (var i = 0; i < cmds.length; i++) {
+            try {
+                var output = execShell(cmds[i]);
+                if (output && output.length > 0) {
+                    // 尝试多种正则匹配
+                    var match = null;
+                    
+                    // 匹配格式: com.example.app/com.example.app.MainActivity
+                    match = output.match(/([a-zA-Z0-9._-]+)\/([a-zA-Z0-9._-]+)/);
+                    if (match) {
+                        pkg = match[1];
+                        act = match[2] || "Unknown";
+                        source = "dumpsys_" + (i + 1);
+                        break;
+                    }
+                    
+                    // 匹配格式: {u0 com.example.app/com.example.app.MainActivity}
+                    match = output.match(/\{[^}]*\s+([a-zA-Z0-9._-]+)\/([a-zA-Z0-9._-]+)/);
+                    if (match) {
+                        pkg = match[1];
+                        act = match[2] || "Unknown";
+                        source = "dumpsys_alt_" + (i + 1);
+                        break;
+                    }
+                    
+                    // 匹配格式: com.example.app
+                    match = output.match(/([a-zA-Z0-9._-]+)/);
+                    if (match && match[1] && match[1].length > 3 && match[1].indexOf('.') > 0) {
+                        pkg = match[1];
+                        source = "dumpsys_pkg_only_" + (i + 1);
+                        break;
+                    }
+                }
+            } catch (e) {
+                // 忽略
+            }
+        }
+    }
+
+    // 方法3: 使用 ps 命令 (备用)
+    if (pkg === "Unknown") {
+        try {
+            // 尝试通过进程列表获取前台进程
+            var output = execShell("ps -A 2>/dev/null | grep -E 'system_server|zygote' | head -1");
+            // 这个方法不太准确，作为最后的备用
+        } catch (e) {}
+    }
+
+    // 如果还是 Unknown，尝试通过 /proc 获取
+    if (pkg === "Unknown") {
+        try {
+            var output = execShell("cat /proc/`pidof system_server`/cmdline 2>/dev/null");
+            // 不太可能获取到，忽略
+        } catch (e) {}
     }
 
     return {
@@ -397,12 +382,13 @@ function getLocation() {
     }
 }
 
-// ==================== 传感器采集 ====================
+// ==================== 传感器采集（持续监听） ====================
 function startSensorCollection() {
     try {
         sensors.ignoresUnsupportedSensor = true;
     } catch (e) {}
 
+    // 定义要监听的传感器
     var sensorList = [
         { name: "accelerometer", key: "accelerometer", type: "3d" },
         { name: "gyroscope", key: "gyroscope", type: "3d" },
@@ -417,6 +403,7 @@ function startSensorCollection() {
         { name: "relative_humidity", key: "relative_humidity", type: "1d" }
     ];
 
+    // 清理旧监听器
     for (var i = 0; i < sensorListeners.length; i++) {
         try {
             sensorListeners[i].unregister();
@@ -445,11 +432,13 @@ function startSensorCollection() {
                 instance.on("change", listener);
                 sensorListeners.push(instance);
             }
-        } catch (e) {}
+        } catch (e) {
+            // 传感器不支持，忽略
+        }
     }
 }
 
-// ==================== 获取传感器数据 ====================
+// ==================== 获取传感器数据（从缓存读取） ====================
 function getSensorData() {
     var result = {};
     var keys = ["accelerometer", "gyroscope", "magnetic_field", "gravity", 
@@ -472,6 +461,7 @@ function collectAllData() {
         permissionLevel: detectPermissionLevel()
     };
 
+    // ===== 基础设备信息 =====
     if (CONFIG.collectBasicInfo) {
         data.device = {
             model: DEVICE_ID,
@@ -484,6 +474,29 @@ function collectAllData() {
             screenDensity: SCREEN_INFO.density
         };
 
+        var propCmds = [
+            { key: "bootloader", cmd: "getprop ro.bootloader" },
+            { key: "hardware", cmd: "getprop ro.hardware" },
+            { key: "board", cmd: "getprop ro.product.board" },
+            { key: "product", cmd: "getprop ro.product.name" },
+            { key: "fingerprint", cmd: "getprop ro.build.fingerprint" }
+        ];
+        var propValues = {};
+        for (var i = 0; i < propCmds.length; i++) {
+            var item = propCmds[i];
+            if (!propValues[item.key]) {
+                try {
+                    var val = execShell(item.cmd);
+                    if (val && val !== "Unknown" && val.length > 0) {
+                        propValues[item.key] = val;
+                    }
+                } catch (e) {}
+            }
+        }
+        for (var key in propValues) {
+            data.device[key] = propValues[key];
+        }
+
         try {
             if (device.getAndroidId) {
                 data.device.androidId = device.getAndroidId();
@@ -491,6 +504,7 @@ function collectAllData() {
         } catch (e) {}
     }
 
+    // ===== 电池信息 =====
     if (CONFIG.collectBattery) {
         var battery = { level: -1, charging: false, temperature: -1, voltage: -1, health: "Unknown" };
         try {
@@ -523,10 +537,12 @@ function collectAllData() {
         data.battery = battery;
     }
 
+    // ===== 前台应用 =====
     if (CONFIG.collectForegroundApp) {
         data.foreground = getForegroundApp();
     }
 
+    // ===== 内存信息 =====
     if (CONFIG.collectMemory) {
         var memory = { total: -1, used: -1, available: -1, usagePercent: -1 };
         try {
@@ -572,6 +588,7 @@ function collectAllData() {
         data.memory = memory;
     }
 
+    // ===== CPU信息 =====
     if (CONFIG.collectCpuInfo) {
         var cpu = { cores: -1, model: "Unknown", usage: -1 };
         try {
@@ -595,6 +612,7 @@ function collectAllData() {
         data.cpu = cpu;
     }
 
+    // ===== 屏幕状态 =====
     if (CONFIG.collectScreenState) {
         var screen = { isOn: false, brightness: -1 };
         try {
@@ -606,6 +624,7 @@ function collectAllData() {
         data.screen = screen;
     }
 
+    // ===== 存储信息 =====
     if (CONFIG.collectStorageInfo) {
         var storage = { total: -1, used: -1, available: -1, usagePercent: -1 };
         try {
@@ -640,10 +659,12 @@ function collectAllData() {
         data.storage = storage;
     }
 
+    // ===== GPS位置 =====
     if (CONFIG.collectLocation) {
         data.location = getLocation();
     }
 
+    // ===== 传感器数据（从缓存获取） =====
     if (CONFIG.collectSensor) {
         var sensorData = getSensorData();
         if (Object.keys(sensorData).length > 0) {
@@ -664,7 +685,7 @@ function connectWebSocket() {
     }
 
     var wsUrl = "ws://" + CONFIG.wsServer;
-    log("🔗 连接: " + wsUrl + (COMPRESSION_ENABLED ? " (压缩模式)" : " (明文模式)"));
+    log("🔗 连接: " + wsUrl);
 
     try {
         ws = web.newWebSocket(wsUrl);
@@ -677,14 +698,16 @@ function connectWebSocket() {
             try {
                 var data = collectAllData();
                 data.dataType = "full";
-                sendDataToServer(data);
+                ws.send(JSON.stringify(data));
+                sendCount++;
+                log("📤 发送 #" + sendCount + " (完整数据)");
             } catch (e) {
                 log("❌ 发送失败: " + e.message);
             }
         });
 
         ws.on("text", function onWsText(text, socket) {
-            // 静默处理
+            // 静默
         });
 
         ws.on("close", function onWsClose(code, reason, socket) {
@@ -713,44 +736,6 @@ function connectWebSocket() {
     }
 }
 
-/**
- * 发送数据到服务器（自动选择压缩或明文）
- */
-function sendDataToServer(data) {
-    if (!ws || !wsConnected) return false;
-    
-    try {
-        var message;
-        var dataType = data.dataType || "diff";
-        
-        if (COMPRESSION_ENABLED) {
-            // 使用压缩
-            var compressed = compressData(data);
-            if (compressed) {
-                message = compressed;
-            } else {
-                // 压缩失败，回退到明文
-                message = JSON.stringify(data);
-            }
-        } else {
-            // 明文传输
-            message = JSON.stringify(data);
-        }
-        
-        ws.send(message);
-        sendCount++;
-        if (sendCount % 20 === 0) {
-            log("📤 已发送 " + sendCount + " 次" + (COMPRESSION_ENABLED ? " (压缩)" : ""));
-        }
-        return true;
-    } catch (e) {
-        log("❌ 发送失败: " + e.message);
-        wsConnected = false;
-        setTimeout(connectWebSocket, 3000);
-        return false;
-    }
-}
-
 // ==================== 定期发送 ====================
 function sendPeriodicData() {
     if (!isRunning) return;
@@ -759,7 +744,11 @@ function sendPeriodicData() {
         try {
             var data = collectAllData();
             data.dataType = "diff";
-            sendDataToServer(data);
+            ws.send(JSON.stringify(data));
+            sendCount++;
+            if (sendCount % 20 === 0) {
+                log("📤 已发送 " + sendCount + " 次");
+            }
         } catch (e) {
             log("❌ 发送失败: " + e.message);
             wsConnected = false;
@@ -791,6 +780,7 @@ globalThis.collectData = function() {
     }
     if (data.foreground) {
         log("  📱 前台: " + data.foreground.packageName + " (" + data.foreground.source + ")");
+        log("  📱 Activity: " + data.foreground.activity);
     }
     if (data.location && data.location.hasLocation) {
         log("  📍 GPS: " + data.location.latitude + ", " + data.location.longitude);
@@ -818,9 +808,8 @@ globalThis.sendData = function() {
         try {
             var data = collectAllData();
             data.dataType = "full";
-            if (sendDataToServer(data)) {
-                log("📤 手动发送成功" + (COMPRESSION_ENABLED ? " (压缩)" : ""));
-            }
+            ws.send(JSON.stringify(data));
+            log("📤 手动发送成功");
         } catch (e) {
             log("❌ 发送失败: " + e.message);
         }
@@ -843,7 +832,6 @@ globalThis.status = function() {
     log("  🌐 服务器: " + CONFIG.wsServer);
     log("  📤 发送: " + sendCount + " 次");
     log("  ⏱️ 间隔: " + CONFIG.updateInterval + "秒");
-    log("  📦 压缩: " + (COMPRESSION_ENABLED ? "✅ 启用" : "❌ 禁用"));
     log("=".repeat(60));
 };
 
@@ -859,7 +847,7 @@ globalThis.stop = function() {
 
 // ==================== 主程序 ====================
 log("=".repeat(60));
-log("📱 设备收集 v11.0 (Gzip压缩版)");
+log("📱 设备收集 v10.0 (传感器高频版)");
 log("=".repeat(60));
 log("📋 设备ID: " + CONFIG.deviceId);
 if (MARKET_NAME) {
@@ -870,14 +858,13 @@ log("📦 Android: " + ANDROID_VERSION + " (SDK " + SDK_VERSION + ")");
 log("📐 屏幕: " + SCREEN_INFO.width + "x" + SCREEN_INFO.height);
 log("🌐 服务器: " + CONFIG.wsServer);
 log("⏱️ 上传间隔: " + CONFIG.updateInterval + "秒");
-log("📦 压缩: " + (COMPRESSION_ENABLED ? "✅ 启用" : "❌ 禁用"));
 log("=".repeat(60));
 
 var level = detectPermissionLevel();
 var names = ["无", "AutoJS", "Shizuku", "Root"];
 log("🔑 权限: " + (names[level] || "未知"));
 
-// 启动传感器采集
+// ===== 启动传感器采集 =====
 log("\n📡 启动传感器采集...");
 try {
     startSensorCollection();
@@ -894,7 +881,12 @@ try {
         log("  📱 " + test.device.model);
     }
     if (test.battery) log("  🔋 " + test.battery.level + "%" + (test.battery.charging ? " (充电中)" : ""));
-    if (test.foreground) log("  📱 前台: " + test.foreground.packageName);
+    if (test.foreground) {
+        log("  📱 前台: " + test.foreground.packageName + " (来源: " + test.foreground.source + ")");
+        if (test.foreground.activity && test.foreground.activity !== "Unknown") {
+            log("  📱 Activity: " + test.foreground.activity);
+        }
+    }
     if (test.memory && test.memory.total > 0) {
         var totalMB = (test.memory.total / 1024 / 1024).toFixed(0);
         var usedMB = (test.memory.used / 1024 / 1024).toFixed(0);
@@ -903,15 +895,6 @@ try {
     if (test.sensors) {
         var sensorKeys = Object.keys(test.sensors);
         log("  📡 传感器: " + sensorKeys.length + "个");
-    }
-    // 测试压缩
-    if (COMPRESSION_ENABLED) {
-        var compressed = compressData(test);
-        if (compressed) {
-            var originalLen = JSON.stringify(test).length;
-            var compressedLen = compressed.length;
-            log("  📦 压缩测试: " + originalLen + " -> " + compressedLen + " 字节 (节省 " + ((1 - compressedLen/originalLen)*100).toFixed(1) + "%)");
-        }
     }
 } catch (e) {
     log("❌ 失败: " + e.message);

@@ -1,0 +1,97 @@
+{
+  "deviceId": "LM-V600",
+  "timestamp": 1785009953571,
+  "permissionLevel": 2,
+  "device": {
+    "model": "LM-V600",
+    "marketName": "LM-V600",
+    "manufacturer": "LGE",
+    "androidVersion": "16",
+    "sdkVersion": 36,
+    "screenWidth": 1080,
+    "screenHeight": 2460,
+    "screenDensity": -1,
+    "androidId": "8f24fdfe61b8193d"
+  },
+  "battery": {
+    "level": 7,
+    "charging": true,
+    "temperature": -1,
+    "voltage": -1,
+    "health": "Unknown"
+  },
+  "foreground": {
+    "packageName": "org.autojs.autojspro",
+    "activity": "org.autojs.autojs.ui.main.MainActivity",
+    "source": "autojs_currentPackage",
+    "isAutoJsService": true
+  },
+  "memory": {
+    "total": 8010129408,
+    "used": 4171984896,
+    "available": 3838144512,
+    "usagePercent": "52.1"
+  },
+  "cpu": {
+    "cores": -1,
+    "model": "Unknown",
+    "usage": -1
+  },
+  "screen": {
+    "isOn": true,
+    "brightness": 25
+  },
+  "storage": {
+    "total": 102844145664,
+    "used": 65219883008,
+    "available": 37624262656,
+    "usagePercent": "63.4"
+  },
+  "location": {
+    "latitude": -1,
+    "longitude": -1,
+    "accuracy": -1,
+    "altitude": -1,
+    "provider": "none",
+    "hasLocation": false
+  },
+  "sensors": {
+    "accelerometer": {
+      "x": 0.018555063754320145,
+      "y": 0.2561795711517334,
+      "z": 9.491812705993652
+    },
+    "gyroscope": {
+      "x": 0.0002663082559593022,
+      "y": 0.0001331541279796511,
+      "z": 0.0002663082559593022
+    },
+    "magnetic_field": {
+      "x": 8.287500381469727,
+      "y": 18.543750762939453,
+      "z": -31.031251907348633
+    },
+    "gravity": {
+      "x": 0.01162701565772295,
+      "y": 0.26584577560424805,
+      "z": 9.803038597106934
+    },
+    "linear_acceleration": {
+      "x": 0.00017897319048643112,
+      "y": -0.00260886549949646,
+      "z": 0.015766143798828125
+    },
+    "orientation": {
+      "x": 335.1029357910156,
+      "y": -1.5537768602371216,
+      "z": 0.06864611059427261
+    },
+    "light": {
+      "value": 0
+    },
+    "proximity": {
+      "value": 5
+    }
+  },
+  "dataType": "diff"
+}

@@ -1,7 +1,7 @@
 {
-    "ws_port": 32767,
-    "web_port": 8080,
-    "host": "0.0.0.0",
-    "data_dir": "device_data",
-    "enable_3d_view": false,
+  "ws_port": 0,
+  "web_port": 80,
+  "host": "0.0.0.0",
+  "data_dir": "device_data",
+  "enable_3d_view": false
 }
