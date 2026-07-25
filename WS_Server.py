@@ -406,10 +406,6 @@ HTML_PAGE = """
                 <div class="num" id="totalClients">0</div>
                 <div class="label">在线设备</div>
             </div>
-            <div class="stat-item">
-                <div class="num" id="totalMessages">0</div>
-                <div class="label">数据包</div>
-            </div>
         </div>
     </div>
 
@@ -715,7 +711,6 @@ HTML_PAGE = """
             .then(data => {
                 deviceStats = data;
                 document.getElementById('totalClients').textContent = data.total_clients || 0;
-                document.getElementById('totalMessages').textContent = data.total_messages || 0;
 
                 var currentStates = {};
                 for (var id in cardStates) {
