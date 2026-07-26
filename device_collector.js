@@ -1,9 +1,18 @@
 // device_collector.js
-// 修复版 - 传感器数据更新频率可配置 + 前台应用获取修复
+// 修复版 - 传感器数据更新频率可配置 + 前台应用获取修复 + 网络监控（无IP版本）
 
 "auto";
 
 console.show();
+
+// ==================== 动态导入 Java 类 ====================
+try {
+    importClass(android.net.ConnectivityManager);
+    importClass(android.net.NetworkInfo);
+    importClass(android.net.TrafficStats);
+} catch(e) {
+    // 部分版本可能不支持
+}
 
 // ==================== 获取设备信息 ====================
 function getDeviceId() {
@@ -106,6 +115,251 @@ function getScreenInfo() {
     }
 }
 
+// ==================== 网络监控函数（无IP版本） ====================
+function getNetworkType() {
+    try {
+        var cm = context.getSystemService("connectivity");
+        if (!cm) {
+            return { type: "未知", detail: "无法获取网络服务", isConnected: false };
+        }
+        
+        var activeNetwork = cm.getActiveNetworkInfo();
+        
+        if (activeNetwork == null || !activeNetwork.isConnected()) {
+            return {
+                type: "无网络",
+                detail: "未连接",
+                isConnected: false,
+                isWifi: false,
+                isMobile: false
+            };
+        }
+
+        var type = activeNetwork.getType();
+        var typeName = activeNetwork.getTypeName();
+        
+        var result = {
+            isConnected: true,
+            type: typeName || "未知",
+            detail: "",
+            isWifi: false,
+            isMobile: false
+        };
+
+        var TYPE_WIFI = 1;
+        var TYPE_MOBILE = 0;
+        
+        if (type == TYPE_WIFI) {
+            result.isWifi = true;
+            result.isMobile = false;
+            result.type = "WiFi";
+            result.detail = "WiFi";
+            
+            try {
+                var wifiManager = context.getSystemService("wifi");
+                if (wifiManager) {
+                    var wifiInfo = wifiManager.getConnectionInfo();
+                    if (wifiInfo) {
+                        // 只获取信号强度，不获取 SSID
+                        try {
+                            var rssi = wifiInfo.getRssi();
+                            if (rssi !== undefined && rssi !== null) {
+                                var level = wifiManager.calculateSignalLevel(rssi, 5);
+                                result.signalLevel = level + "/5";
+                            }
+                        } catch(e) {}
+                    }
+                }
+            } catch(e) {}
+        }
+        else if (type == TYPE_MOBILE) {
+            result.isWifi = false;
+            result.isMobile = true;
+            result.type = "移动网络";
+            result.detail = "移动网络";
+            
+            try {
+                var tm = context.getSystemService("phone");
+                if (tm) {
+                    try {
+                        var networkType = tm.getDataNetworkType();
+                        var networkTypeNames = {
+                            0: "未知",
+                            1: "GPRS",
+                            2: "EDGE",
+                            3: "UMTS",
+                            4: "CDMA",
+                            5: "EVDO_0",
+                            6: "EVDO_A",
+                            7: "1xRTT",
+                            8: "HSDPA",
+                            9: "HSUPA",
+                            10: "HSPA",
+                            11: "IDEN",
+                            12: "EVDO_B",
+                            13: "LTE",
+                            14: "EHRPD",
+                            15: "HSPAP",
+                            16: "GSM",
+                            17: "TD_SCDMA",
+                            18: "IWLAN",
+                            19: "LTE_CA",
+                            20: "NR"
+                        };
+                        var netName = networkTypeNames[networkType] || "未知制式";
+                        result.detail += " (" + netName + ")";
+                        result.networkType = netName;
+                    } catch(e) {}
+                }
+            } catch(e) {}
+        }
+        else {
+            result.detail = typeName + " 已连接";
+        }
+
+        return result;
+    } catch (e) {
+        return {
+            type: "获取失败",
+            detail: "错误",
+            isConnected: false,
+            isWifi: false,
+            isMobile: false
+        };
+    }
+}
+
+function getNetworkSpeed() {
+    try {
+        var currentRx = 0;
+        var currentTx = 0;
+        
+        try {
+            if (typeof TrafficStats !== 'undefined') {
+                currentRx = TrafficStats.getTotalRxBytes();
+                currentTx = TrafficStats.getTotalTxBytes();
+            }
+        } catch(e) {}
+        
+        return {
+            totalRx: currentRx,
+            totalTx: currentTx
+        };
+    } catch (e) {
+        return { totalRx: 0, totalTx: 0 };
+    }
+}
+
+function formatSpeed(bytesPerSecond) {
+    if (bytesPerSecond < 0) return "0 B/s";
+    if (bytesPerSecond < 1024) {
+        return bytesPerSecond.toFixed(0) + " B/s";
+    } else if (bytesPerSecond < 1024 * 1024) {
+        return (bytesPerSecond / 1024).toFixed(1) + " KB/s";
+    } else if (bytesPerSecond < 1024 * 1024 * 1024) {
+        return (bytesPerSecond / 1024 / 1024).toFixed(1) + " MB/s";
+    } else {
+        return (bytesPerSecond / 1024 / 1024 / 1024).toFixed(1) + " GB/s";
+    }
+}
+
+function formatBytes(bytes) {
+    if (bytes < 0) return "0 B";
+    if (bytes < 1024) {
+        return bytes.toFixed(0) + " B";
+    } else if (bytes < 1024 * 1024) {
+        return (bytes / 1024).toFixed(1) + " KB";
+    } else if (bytes < 1024 * 1024 * 1024) {
+        return (bytes / 1024 / 1024).toFixed(1) + " MB";
+    } else {
+        return (bytes / 1024 / 1024 / 1024).toFixed(2) + " GB";
+    }
+}
+
+// ==================== 网络监控状态（无IP） ====================
+var networkState = {
+    lastRx: 0,
+    lastTx: 0,
+    lastTime: 0,
+    initialized: false
+};
+
+function getNetworkStats(intervalSeconds) {
+    var speedData = getNetworkSpeed();
+    var currentRx = speedData.totalRx;
+    var currentTx = speedData.totalTx;
+    var currentTime = Date.now();
+    var result = {
+        type: "未知",
+        detail: "未获取",
+        isConnected: false,
+        isWifi: false,
+        isMobile: false,
+        downSpeed: 0,
+        upSpeed: 0,
+        downSpeedStr: "0 B/s",
+        upSpeedStr: "0 B/s",
+        totalRx: currentRx,
+        totalTx: currentTx,
+        totalRxStr: formatBytes(currentRx),
+        totalTxStr: formatBytes(currentTx),
+        intervalRx: 0,
+        intervalTx: 0,
+        intervalRxStr: "0 B",
+        intervalTxStr: "0 B"
+    };
+
+    // 获取网络类型
+    var netInfo = getNetworkType();
+    result.type = netInfo.type;
+    result.detail = netInfo.detail;
+    result.isConnected = netInfo.isConnected;
+    result.isWifi = netInfo.isWifi;
+    result.isMobile = netInfo.isMobile;
+    if (netInfo.signalLevel) {
+        result.signalLevel = netInfo.signalLevel;
+    }
+    if (netInfo.networkType) {
+        result.networkType = netInfo.networkType;
+    }
+
+    // 计算网速
+    if (!networkState.initialized) {
+        networkState.lastRx = currentRx;
+        networkState.lastTx = currentTx;
+        networkState.lastTime = currentTime;
+        networkState.initialized = true;
+        return result;
+    }
+
+    var timeDiff = (currentTime - networkState.lastTime) / 1000;
+    if (timeDiff < 0.1) {
+        timeDiff = 0.1;
+    }
+
+    var rxDiff = currentRx - networkState.lastRx;
+    var txDiff = currentTx - networkState.lastTx;
+
+    if (rxDiff < 0) rxDiff = 0;
+    if (txDiff < 0) txDiff = 0;
+
+    result.intervalRx = rxDiff;
+    result.intervalTx = txDiff;
+    result.intervalRxStr = formatBytes(rxDiff);
+    result.intervalTxStr = formatBytes(txDiff);
+
+    result.downSpeed = rxDiff / timeDiff;
+    result.upSpeed = txDiff / timeDiff;
+    result.downSpeedStr = formatSpeed(result.downSpeed);
+    result.upSpeedStr = formatSpeed(result.upSpeed);
+
+    networkState.lastRx = currentRx;
+    networkState.lastTx = currentTx;
+    networkState.lastTime = currentTime;
+
+    return result;
+}
+
 // ==================== 配置 ====================
 var DEVICE_ID = getDeviceId();
 var MARKET_NAME = getMarketName();
@@ -116,7 +370,7 @@ var SCREEN_INFO = getScreenInfo();
 
 var CONFIG = {
     "deviceId": DEVICE_ID,
-    "wsServer": "localhost:114514",
+    "wsServer": "localhost:32767",
     "updateInterval": 5,  // 数据上传间隔（秒）
     "collectBasicInfo": true,
     "collectBattery": true,
@@ -128,7 +382,8 @@ var CONFIG = {
     "collectLocation": true,
     "collectSensor": true,
     "collectProcesses": true,
-    "collectPackages": true
+    "collectPackages": true,
+    "collectNetwork": true  // 网络监控开关
 };
 
 // ==================== 打印设备信息 ====================
@@ -218,10 +473,8 @@ function getForegroundApp() {
     var act = "Unknown";
     var source = "none";
 
-    // 方法1: 使用 Auto.js 原生 API (需要无障碍服务)
     if (auto.service) {
         try {
-            // 尝试使用 currentPackage()
             if (typeof currentPackage === 'function') {
                 var p = currentPackage();
                 if (p && p !== "Unknown" && p !== "" && p !== null && typeof p === 'string' && p.length > 0) {
@@ -233,7 +486,6 @@ function getForegroundApp() {
             log("⚠️ currentPackage() 调用失败: " + e.message);
         }
 
-        // 如果 currentPackage 失败，尝试使用 app.currentPackage()
         if (pkg === "Unknown") {
             try {
                 if (typeof app.currentPackage === 'function') {
@@ -243,12 +495,9 @@ function getForegroundApp() {
                         source = "autojs_app_currentPackage";
                     }
                 }
-            } catch (e) {
-                // 静默处理
-            }
+            } catch (e) {}
         }
 
-        // 获取 Activity
         try {
             if (typeof currentActivity === 'function') {
                 var a = currentActivity();
@@ -270,15 +519,10 @@ function getForegroundApp() {
         }
     }
 
-    // 方法2: 使用 dumpsys (不需要无障碍, 但需要权限)
     if (pkg === "Unknown") {
-        // 多个 dumpsys 命令尝试
         var cmds = [
-            // Android 8+ 推荐
             "dumpsys activity activities 2>/dev/null | grep -E 'mResumedActivity|mFocusedActivity|mCurrentFocus' | head -1",
-            // 旧版本兼容
             "dumpsys window windows 2>/dev/null | grep -E 'mCurrentFocus' | head -1",
-            // 备用方法
             "dumpsys activity top 2>/dev/null | grep -E 'ACTIVITY|TASK' | head -5"
         ];
 
@@ -286,10 +530,8 @@ function getForegroundApp() {
             try {
                 var output = execShell(cmds[i]);
                 if (output && output.length > 0) {
-                    // 尝试多种正则匹配
                     var match = null;
                     
-                    // 匹配格式: com.example.app/com.example.app.MainActivity
                     match = output.match(/([a-zA-Z0-9._-]+)\/([a-zA-Z0-9._-]+)/);
                     if (match) {
                         pkg = match[1];
@@ -298,7 +540,6 @@ function getForegroundApp() {
                         break;
                     }
                     
-                    // 匹配格式: {u0 com.example.app/com.example.app.MainActivity}
                     match = output.match(/\{[^}]*\s+([a-zA-Z0-9._-]+)\/([a-zA-Z0-9._-]+)/);
                     if (match) {
                         pkg = match[1];
@@ -307,7 +548,6 @@ function getForegroundApp() {
                         break;
                     }
                     
-                    // 匹配格式: com.example.app
                     match = output.match(/([a-zA-Z0-9._-]+)/);
                     if (match && match[1] && match[1].length > 3 && match[1].indexOf('.') > 0) {
                         pkg = match[1];
@@ -315,27 +555,8 @@ function getForegroundApp() {
                         break;
                     }
                 }
-            } catch (e) {
-                // 忽略
-            }
+            } catch (e) {}
         }
-    }
-
-    // 方法3: 使用 ps 命令 (备用)
-    if (pkg === "Unknown") {
-        try {
-            // 尝试通过进程列表获取前台进程
-            var output = execShell("ps -A 2>/dev/null | grep -E 'system_server|zygote' | head -1");
-            // 这个方法不太准确，作为最后的备用
-        } catch (e) {}
-    }
-
-    // 如果还是 Unknown，尝试通过 /proc 获取
-    if (pkg === "Unknown") {
-        try {
-            var output = execShell("cat /proc/`pidof system_server`/cmdline 2>/dev/null");
-            // 不太可能获取到，忽略
-        } catch (e) {}
     }
 
     return {
@@ -388,7 +609,6 @@ function startSensorCollection() {
         sensors.ignoresUnsupportedSensor = true;
     } catch (e) {}
 
-    // 定义要监听的传感器
     var sensorList = [
         { name: "accelerometer", key: "accelerometer", type: "3d" },
         { name: "gyroscope", key: "gyroscope", type: "3d" },
@@ -403,7 +623,6 @@ function startSensorCollection() {
         { name: "relative_humidity", key: "relative_humidity", type: "1d" }
     ];
 
-    // 清理旧监听器
     for (var i = 0; i < sensorListeners.length; i++) {
         try {
             sensorListeners[i].unregister();
@@ -432,9 +651,7 @@ function startSensorCollection() {
                 instance.on("change", listener);
                 sensorListeners.push(instance);
             }
-        } catch (e) {
-            // 传感器不支持，忽略
-        }
+        } catch (e) {}
     }
 }
 
@@ -672,6 +889,32 @@ function collectAllData() {
         }
     }
 
+    // ===== 网络信息（无IP） =====
+    if (CONFIG.collectNetwork) {
+        var netStats = getNetworkStats(CONFIG.updateInterval);
+        data.network = {
+            type: netStats.type,
+            detail: netStats.detail,
+            isConnected: netStats.isConnected,
+            isWifi: netStats.isWifi,
+            isMobile: netStats.isMobile,
+            signalLevel: netStats.signalLevel || null,
+            networkType: netStats.networkType || null,
+            downSpeed: netStats.downSpeed,
+            upSpeed: netStats.upSpeed,
+            downSpeedStr: netStats.downSpeedStr,
+            upSpeedStr: netStats.upSpeedStr,
+            intervalRx: netStats.intervalRx,
+            intervalTx: netStats.intervalTx,
+            intervalRxStr: netStats.intervalRxStr,
+            intervalTxStr: netStats.intervalTxStr,
+            totalRx: netStats.totalRx,
+            totalTx: netStats.totalTx,
+            totalRxStr: netStats.totalRxStr,
+            totalTxStr: netStats.totalTxStr
+        };
+    }
+
     return data;
 }
 
@@ -706,9 +949,7 @@ function connectWebSocket() {
             }
         });
 
-        ws.on("text", function onWsText(text, socket) {
-            // 静默
-        });
+        ws.on("text", function onWsText(text, socket) {});
 
         ws.on("close", function onWsClose(code, reason, socket) {
             if (!isRunning) return;
@@ -719,9 +960,7 @@ function connectWebSocket() {
             }
         });
 
-        ws.on("error", function onWsError(err, socket) {
-            // 忽略
-        });
+        ws.on("error", function onWsError(err, socket) {});
 
         ws.on("failure", function onWsFailure(err, res, socket) {
             if (!isRunning) return;
@@ -800,6 +1039,12 @@ globalThis.collectData = function() {
             }
         }
     }
+    if (data.network) {
+        log("  🌐 网络: " + data.network.type + (data.network.isConnected ? " ✅" : " ❌"));
+        log("  ⬇️ 下载: " + data.network.downSpeedStr + " (间隔 " + data.network.intervalRxStr + ")");
+        log("  ⬆️ 上传: " + data.network.upSpeedStr + " (间隔 " + data.network.intervalTxStr + ")");
+        log("  📊 总下载: " + data.network.totalRxStr + " | 总上传: " + data.network.totalTxStr);
+    }
     return data;
 };
 
@@ -847,7 +1092,7 @@ globalThis.stop = function() {
 
 // ==================== 主程序 ====================
 log("=".repeat(60));
-log("📱 设备收集 v10.0 (传感器高频版)");
+log("📱 设备收集 v11.0 (网络监控版 - 无IP)");
 log("=".repeat(60));
 log("📋 设备ID: " + CONFIG.deviceId);
 if (MARKET_NAME) {
@@ -863,6 +1108,19 @@ log("=".repeat(60));
 var level = detectPermissionLevel();
 var names = ["无", "AutoJS", "Shizuku", "Root"];
 log("🔑 权限: " + (names[level] || "未知"));
+
+// 初始化网络统计
+log("\n🌐 初始化网络监控...");
+try {
+    getNetworkStats(CONFIG.updateInterval);
+    var netTest = getNetworkStats(CONFIG.updateInterval);
+    log("✅ 网络监控已启动");
+    log("  🌐 网络类型: " + netTest.type);
+    log("  📊 总下载: " + netTest.totalRxStr);
+    log("  📊 总上传: " + netTest.totalTxStr);
+} catch (e) {
+    log("❌ 网络监控初始化失败: " + e.message);
+}
 
 // ===== 启动传感器采集 =====
 log("\n📡 启动传感器采集...");
@@ -895,6 +1153,11 @@ try {
     if (test.sensors) {
         var sensorKeys = Object.keys(test.sensors);
         log("  📡 传感器: " + sensorKeys.length + "个");
+    }
+    if (test.network) {
+        log("  🌐 网络: " + test.network.type + " (" + test.network.detail + ")");
+        log("  ⬇️ " + test.network.downSpeedStr + "  ⬆️ " + test.network.upSpeedStr);
+        log("  📊 间隔流量: ⬇️" + test.network.intervalRxStr + " ⬆️" + test.network.intervalTxStr);
     }
 } catch (e) {
     log("❌ 失败: " + e.message);

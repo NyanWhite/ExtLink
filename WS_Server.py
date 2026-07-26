@@ -1,5 +1,5 @@
 ﻿# ws_server.py
-# 修复版 - 去掉3D显示，传感器数据全量展示
+# 修复版 - 去掉3D显示，传感器数据全量展示 + 网络监控显示
 
 import asyncio
 import json
@@ -183,22 +183,49 @@ class DeviceDataServer:
         for client_id, data in self.device_data.items():
             last_seen = self.device_last_seen.get(client_id, 0)
             info = self.device_info.get(client_id, {})
-            # 从数据中提取timestamp
             data_timestamp = data.get('timestamp', 0)
+            
+            # 提取网络信息
+            network = data.get('network', {})
+            
             stats["devices"][client_id] = {
                 "last_seen": datetime.fromtimestamp(last_seen).isoformat() if last_seen else None,
-                "data_timestamp": data_timestamp,  # 添加数据时间戳
+                "data_timestamp": data_timestamp,
                 "data_fields": len(data),
                 "has_battery": 'battery' in data,
                 "has_foreground": 'foreground' in data,
                 "has_location": 'location' in data and data.get('location', {}).get('hasLocation', False),
                 "has_sensors": 'sensors' in data,
+                "has_network": 'network' in data,
                 "permission_level": data.get('permissionLevel', 'unknown'),
                 "device_model": info.get('device_model', 'Unknown'),
                 "device_manufacturer": info.get('device_manufacturer', 'Unknown'),
                 "screen_width": info.get('screen_width', 1080),
                 "screen_height": info.get('screen_height', 2400),
-                "first_seen": info.get('first_seen', 'Unknown')
+                "first_seen": info.get('first_seen', 'Unknown'),
+                # 网络信息
+                "network": {
+                    "type": network.get('type', '未知'),
+                    "detail": network.get('detail', ''),
+                    "isConnected": network.get('isConnected', False),
+                    "isWifi": network.get('isWifi', False),
+                    "isMobile": network.get('isMobile', False),
+                    "ip": network.get('ip', '未知'),
+                    "signalLevel": network.get('signalLevel'),
+                    "networkType": network.get('networkType'),
+                    "downSpeed": network.get('downSpeed', 0),
+                    "upSpeed": network.get('upSpeed', 0),
+                    "downSpeedStr": network.get('downSpeedStr', '0 B/s'),
+                    "upSpeedStr": network.get('upSpeedStr', '0 B/s'),
+                    "intervalRx": network.get('intervalRx', 0),
+                    "intervalTx": network.get('intervalTx', 0),
+                    "intervalRxStr": network.get('intervalRxStr', '0 B'),
+                    "intervalTxStr": network.get('intervalTxStr', '0 B'),
+                    "totalRx": network.get('totalRx', 0),
+                    "totalTx": network.get('totalTx', 0),
+                    "totalRxStr": network.get('totalRxStr', '0 B'),
+                    "totalTxStr": network.get('totalTxStr', '0 B')
+                } if network else None
             }
 
         return stats
@@ -256,6 +283,8 @@ HTML_PAGE = """
             background: rgba(0, 0, 0, 0.2);
             user-select: none;
             transition: background 0.2s;
+            flex-wrap: wrap;
+            gap: 8px;
         }
         .card-header:hover { background: rgba(0, 100, 200, 0.1); }
         .card-header .device-name {
@@ -268,6 +297,7 @@ HTML_PAGE = """
             align-items: center;
             gap: 12px;
             font-size: 13px;
+            flex-wrap: wrap;
         }
         .card-header .device-status .dot {
             width: 8px;
@@ -391,6 +421,28 @@ HTML_PAGE = """
             color: #00d4ff;
             font-family: monospace;
         }
+
+        /* 网络状态指示 */
+        .network-status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            padding: 4px 10px;
+            border-radius: 12px;
+            background: rgba(0, 0, 0, 0.3);
+        }
+        .network-status .connected { color: #00ff88; }
+        .network-status .disconnected { color: #ff4444; }
+        
+        .speed-display {
+            display: flex;
+            gap: 16px;
+            font-size: 13px;
+            font-family: monospace;
+        }
+        .speed-display .down { color: #00d4ff; }
+        .speed-display .up { color: #ffaa00; }
     </style>
 </head>
 <body>
@@ -472,7 +524,6 @@ HTML_PAGE = """
         return '';
     }
     
-    // 格式化时间戳（毫秒转本地时间）
     function formatTimestamp(ts) {
         if (!ts || ts <= 0) return '未知';
         try {
@@ -545,12 +596,26 @@ HTML_PAGE = """
 
             var sensors = detail.sensors || {};
 
+            // ===== 网络信息 =====
+            var network = dev.network || {};
+            var netType = network.type || '未知';
+            var netConnected = network.isConnected || false;
+            var netDownSpeed = network.downSpeedStr || '0 B/s';
+            var netUpSpeed = network.upSpeedStr || '0 B/s';
+            var netIntervalRx = network.intervalRxStr || '0 B';
+            var netIntervalTx = network.intervalTxStr || '0 B';
+            var netTotalRx = network.totalRxStr || '0 B';
+            var netTotalTx = network.totalTxStr || '0 B';
+            var netIp = network.ip || '未知';
+            var netDetail = network.detail || '';
+            var netSignalLevel = network.signalLevel || '';
+            var netTypeDetail = network.networkType || '';
+
             var deviceModel = dev.device_model || clientId;
             var deviceManufacturer = dev.device_manufacturer || '';
             var screenWidth = dev.screen_width || 1080;
             var screenHeight = dev.screen_height || 2400;
             
-            // 获取数据时间戳
             var dataTimestamp = dev.data_timestamp || 0;
             var updateTimeStr = formatTimestamp(dataTimestamp);
 
@@ -565,7 +630,6 @@ HTML_PAGE = """
             var sensorKeys = Object.keys(sensors);
             var sensorHtml = '';
             
-            // 优先级排序
             var priorityOrder = ['accelerometer', 'gyroscope', 'magnetic_field', 'gravity', 'linear_acceleration', 'orientation', 'light', 'proximity', 'ambient_temperature', 'pressure', 'relative_humidity'];
             var sortedKeys = [];
             for (var i = 0; i < priorityOrder.length; i++) {
@@ -602,6 +666,17 @@ HTML_PAGE = """
 
             var sensorCount = sortedKeys.length;
 
+            // ===== 网络状态图标 =====
+            var netIcon = netConnected ? '✅' : '❌';
+            var netStatusClass = netConnected ? 'connected' : 'disconnected';
+            var netTypeDisplay = netType;
+            if (netTypeDetail) {
+                netTypeDisplay += ' (' + netTypeDetail + ')';
+            }
+            if (netSignalLevel) {
+                netTypeDisplay += ' 信号: ' + netSignalLevel;
+            }
+
             html += `
             <div class="card ${isOnline ? '' : 'offline'}" id="${cardId}">
                 <div class="card-header" onclick="toggleCard('${bodyId}', '${clientId}')">
@@ -613,6 +688,10 @@ HTML_PAGE = """
                     <div class="device-status">
                         <span>🔋 ${batteryLevel}%</span>
                         <span>📱 ${fgName.length > 15 ? fgName.substring(0, 15)+'...' : fgName}</span>
+                        <span class="network-status">
+                            <span class="${netStatusClass}">${netIcon}</span>
+                            ${netType}
+                        </span>
                         <span>
                             <span class="dot ${isOnline ? 'online' : 'offline'}"></span>
                             ${isOnline ? '在线' : '离线'}
@@ -652,6 +731,28 @@ HTML_PAGE = """
                                     <div class="label">📍 位置</div>
                                     <div class="value" style="font-size:13px;">${locationStr}</div>
                                     <div class="sub">${hasLocation ? '✅ GPS定位' : '❌ 无定位'}</div>
+                                </div>
+                            </div>
+                            <!-- 网络详细信息 -->
+                            <div class="data-grid" style="margin-top:10px;">
+                                <div class="data-item" style="border-left-color:#00d4ff;">
+                                    <div class="label">🌐 网络</div>
+                                    <div class="value" style="font-size:14px;">${netTypeDisplay}</div>
+                                    <div class="sub">${netDetail ? '| ' + netDetail : ''}</div>
+                                </div>
+                                <div class="data-item" style="border-left-color:#00d4ff;">
+                                    <div class="label">⬇️ 下载速度</div>
+                                    <div class="value good">${netDownSpeed}</div>
+                                    <div class="sub">间隔流量: ${netIntervalRx}</div>
+                                </div>
+                                <div class="data-item" style="border-left-color:#ffaa00;">
+                                    <div class="label">⬆️ 上传速度</div>
+                                    <div class="value warning">${netUpSpeed}</div>
+                                    <div class="sub">间隔流量: ${netIntervalTx}</div>
+                                </div>
+                                <div class="data-item" style="border-left-color:#667788;">
+                                    <div class="label">📊 总流量</div>
+                                    <div class="value" style="font-size:13px;">⬇️ ${netTotalRx} / ⬆️ ${netTotalTx}</div>
                                 </div>
                             </div>
                         </div>
@@ -799,7 +900,7 @@ async def main():
     host = CONFIG.get("host", "0.0.0.0")
 
     logger.info("=" * 80)
-    logger.info("📱 设备数据接收服务器 v7.0")
+    logger.info("📱 设备数据接收服务器 v8.0 (网络监控版)")
     logger.info("=" * 80)
     logger.info(f"🌐 WebSocket: ws://{host}:{ws_port}")
     logger.info(f"🌐 Web界面: http://{host}:{web_port}")
