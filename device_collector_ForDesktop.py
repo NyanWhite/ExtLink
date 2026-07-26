@@ -219,11 +219,19 @@ def get_cpu_info():
 
 # ==================== 存储信息 ====================
 def get_storage_info():
-    """获取存储信息"""
+    """获取存储信息（汇总所有磁盘）"""
     try:
         partitions = []
+        total_size = 0
+        total_used = 0
+        total_free = 0
+        
         for partition in psutil.disk_partitions():
             try:
+                # 只处理可读写的物理磁盘（跳过光驱、虚拟盘等）
+                if 'cdrom' in partition.opts or 'removable' in partition.opts:
+                    continue
+                
                 usage = psutil.disk_usage(partition.mountpoint)
                 partitions.append({
                     "mountpoint": partition.mountpoint,
@@ -231,23 +239,36 @@ def get_storage_info():
                     "used": usage.used,
                     "available": usage.free,
                     "usagePercent": round(usage.percent, 1),
-                    "filesystem": partition.fstype
+                    "filesystem": partition.fstype,
+                    "device": partition.device
                 })
+                
+                total_size += usage.total
+                total_used += usage.used
+                total_free += usage.free
             except:
                 pass
         
-        # 系统盘（C:）作为主要存储
-        main_storage = {"total": -1, "used": -1, "available": -1, "usagePercent": -1}
-        for p in partitions:
-            if p["mountpoint"].startswith("C:"):
-                main_storage = p
-                break
-        if main_storage["total"] == -1 and partitions:
-            main_storage = partitions[0]
+        # 如果没有找到任何分区，返回默认值
+        if not partitions:
+            return {"total": -1, "used": -1, "available": -1, "usagePercent": -1, "partitions": []}
         
-        return main_storage
-    except:
-        return {"total": -1, "used": -1, "available": -1, "usagePercent": -1}
+        # 计算总使用百分比
+        total_percent = 0
+        if total_size > 0:
+            total_percent = round((total_used / total_size) * 100, 1)
+        
+        return {
+            "total": total_size,
+            "used": total_used,
+            "available": total_free,
+            "usagePercent": total_percent,
+            "partitions": partitions,  # 保留分区详情供后续使用
+            "partitionCount": len(partitions)
+        }
+    except Exception as e:
+        logger.debug(f"获取存储信息失败: {e}")
+        return {"total": -1, "used": -1, "available": -1, "usagePercent": -1, "partitions": []}
 
 # ==================== 网络信息 ====================
 class NetworkStats:
