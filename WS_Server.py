@@ -1,6 +1,5 @@
 ﻿# ws_server.py
 # 模块化存储 + 历史记录滑动窗口 + 可配置模块 + 多指标折线图（字段级智能单位转换 + 图表容器复用防重置）
-# 新增：电池充满/耗尽时间估算（基于 current, capacity, level）
 
 import asyncio
 import json
@@ -483,45 +482,6 @@ class DeviceDataServer:
             data_timestamp = data.get('timestamp', 0)
             network = data.get('network', {})
 
-            # ---------- 电池估算 ----------
-            battery_estimate = None
-            battery_data = data.get('battery', {})
-            if isinstance(battery_data, dict):
-                level = battery_data.get('level')
-                current_raw = battery_data.get('current')   # 原始单位：µA
-                capacity_raw = battery_data.get('capacity') # 原始单位：mAh
-                charging = battery_data.get('charging', False)
-                if (level is not None and current_raw is not None and capacity_raw is not None
-                        and capacity_raw > 0):
-                    current_mA = current_raw
-                    if charging and current_mA > 0:
-                        # 充电：计算充满所需时间
-                        remaining_mAh = capacity_raw * (100 - level) / 100.0
-                        if remaining_mAh > 0:
-                            hours = remaining_mAh / current_mA
-                            seconds = hours * 3600
-                            battery_estimate = {
-                                'type': 'charging',
-                                'time_to_full_seconds': seconds,
-                                'full_time': int((time.time() + seconds) * 1000)
-                            }
-                        else:
-                            # 已充满
-                            battery_estimate = {'type': 'charged', 'time_to_full_seconds': 0}
-                    elif not charging and current_mA < 0:
-                        # 放电：计算耗尽所需时间
-                        remaining_mAh = capacity_raw * level / 100.0
-                        if remaining_mAh > 0:
-                            hours = remaining_mAh / abs(current_mA)
-                            seconds = hours * 3600
-                            battery_estimate = {
-                                'type': 'discharging',
-                                'time_to_empty_seconds': seconds,
-                                'empty_time': int((time.time() + seconds) * 1000)
-                            }
-                        else:
-                            battery_estimate = {'type': 'empty', 'time_to_empty_seconds': 0}
-
             stats["devices"][client_id] = {
                 "last_seen": datetime.fromtimestamp(last_seen).isoformat() if last_seen else None,
                 "data_timestamp": data_timestamp,
@@ -560,7 +520,6 @@ class DeviceDataServer:
                     "totalTxStr": network.get('totalTxStr', '0 B')
                 } if network else None,
                 "battery": data.get('battery', {}),
-                "battery_estimate": battery_estimate,   # 新增
                 "foreground": data.get('foreground', {}),
                 "memory": data.get('memory', {}),
                 "storage": data.get('storage', {}),
@@ -678,7 +637,7 @@ class DeviceDataServer:
         )
 
 
-# ==================== HTML页面（字段级智能单位转换 + 图表容器复用 + 电池估算） ====================
+# ==================== HTML页面（字段级智能单位转换 + 图表容器复用） ====================
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -874,7 +833,7 @@ HTML_PAGE = """
         if (module === 'battery') {
             // 电压 mV → V
             if (field === 'voltage') {
-                return { data: raw.map(v => v !== null ? v / 1000 : null), unit: ' V' };
+                return { data: raw, unit: ' mV' };
             }
             // 电流 µA → mA (假设原始是µA)
             if (field === 'current') {
@@ -1209,7 +1168,7 @@ HTML_PAGE = """
         loadHistory(deviceId, module);
     }
 
-    // ==================== 渲染设备（复用图表容器 + 电池估算） ====================
+    // ==================== 渲染设备（复用图表容器） ====================
     function renderDevices(stats) {
         var container = document.getElementById('devicesContainer');
         if (!container) return;
@@ -1241,35 +1200,6 @@ HTML_PAGE = """
 
         container.innerHTML = '';
 
-        // 辅助函数：格式化时长
-        function formatDuration(seconds) {
-            if (!seconds || seconds < 0) return '--:--';
-            if (seconds < 60) return '0分钟';
-            var hours = Math.floor(seconds / 3600);
-            var minutes = Math.floor((seconds % 3600) / 60);
-            if (hours > 0) {
-                return hours + '小时' + minutes + '分钟';
-            } else {
-                return minutes + '分钟';
-            }
-        }
-        // 辅助函数：格式化到达时间
-        function formatArrivalTime(ts) {
-            if (!ts) return '--:--';
-            var d = new Date(ts);
-            var now = new Date();
-            var today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-            var tomorrow = new Date(today.getTime() + 86400000);
-            var target = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-            var prefix = '';
-            if (target.getTime() === today.getTime()) prefix = '今天 ';
-            else if (target.getTime() === tomorrow.getTime()) prefix = '明天 ';
-            else {
-                return d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
-            }
-            return prefix + d.toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-        }
-
         var html = '';
         for (var i = 0; i < deviceKeys.length; i++) {
             var clientId = deviceKeys[i];
@@ -1279,35 +1209,6 @@ HTML_PAGE = """
             var battery = dev.battery || {};
             var batteryLevel = battery.level !== undefined ? battery.level : '?';
             var batteryClass = batteryLevel >= 50 ? 'good' : (batteryLevel >= 20 ? 'warning' : 'danger');
-
-            // 电池估算
-            var batteryEst = dev.battery_estimate || null;
-            var batterySub = battery.charging ? '⚡ 充电中' : '🔌 未充电';
-            if (batteryEst) {
-                if (batteryEst.type === 'charging') {
-                    var secs = batteryEst.time_to_full_seconds;
-                    if (secs > 0) {
-                        var dur = formatDuration(secs);
-                        var arrival = formatArrivalTime(batteryEst.full_time);
-                        batterySub += ' - 距离充满 ' + dur + ' - 到达时间 ' + arrival;
-                    } else {
-                        batterySub += ' - 已充满';
-                    }
-                } else if (batteryEst.type === 'discharging') {
-                    var secs = batteryEst.time_to_empty_seconds;
-                    if (secs > 0) {
-                        var dur = formatDuration(secs);
-                        var arrival = formatArrivalTime(batteryEst.empty_time);
-                        batterySub += ' - 距离耗尽 ' + dur + ' - 到达时间 ' + arrival;
-                    } else {
-                        batterySub += ' - 已耗尽';
-                    }
-                } else if (batteryEst.type === 'charged') {
-                    batterySub += ' - 已充满';
-                } else if (batteryEst.type === 'empty') {
-                    batterySub += ' - 已耗尽';
-                }
-            }
 
             var foreground = dev.foreground || {};
             var fgTitle = foreground.windowTitle || foreground.packageName || 'Unknown';
@@ -1372,7 +1273,7 @@ HTML_PAGE = """
             if (netSignalLevel) netTypeDisplay += ' 信号: ' + netSignalLevel;
 
             var dataItems = [
-                { label: '🔋 电池', value: batteryLevel + '%', sub: batterySub, cls: batteryClass, module: 'battery' },
+                { label: '🔋 电池', value: batteryLevel + '%', sub: battery.charging ? '⚡ 充电中' : '🔌 未充电', cls: batteryClass, module: 'battery' },
                 { label: '💾 内存', value: memoryUsedMB + ' / ' + memoryMB + ' MB', sub: '使用 ' + memoryPercent + '%', module: 'memory' },
                 { label: '💾 存储', value: storageUsedGB + ' / ' + storageGB + ' GB', sub: '使用 ' + storagePercent + '%', module: 'storage' },
                 { label: '📱 前台', value: fgTitle, sub: fgApp, module: 'foreground' },
@@ -1494,10 +1395,13 @@ HTML_PAGE = """
             }
         }
 
-        // 恢复已有图表的 option
+        // 恢复已有图表的 option（但需要重新应用转换？如果之前已加载数据，则重新渲染可保持状态）
+        // 由于我们只移动容器，图表实例中的 seriesData 还在，但可能需要重新应用转换（因为转换规则可能不变）
+        // 但为了保留缩放状态，我们只 resize，option 不变
         for (var id in chartInstances) {
             var inst = chartInstances[id];
             if (inst.currentModule && inst.seriesData.timestamps.length > 0) {
+                // 确保容器存在
                 var containerId = 'chart-' + id.replace(/[^a-zA-Z0-9]/g, '_');
                 var el = document.getElementById(containerId);
                 if (el && inst.chart) {
@@ -1574,7 +1478,7 @@ HTML_PAGE = """
     }
 
     connectWebSocket();
-    console.log('📱 DeviceMonitor (智能单位转换, 图表容器复用, 电池估算) 已启动');
+    console.log('📱 DeviceMonitor (智能单位转换, 图表容器复用) 已启动');
 </script>
 </body>
 </html>
@@ -1680,7 +1584,7 @@ async def main():
     host = CONFIG.get("host", "0.0.0.0")
 
     logger.info("=" * 80)
-    logger.info("📱 设备数据接收服务器 v15.3 (智能单位转换 + 电池估算)")
+    logger.info("📱 设备数据接收服务器 v15.3 (智能单位转换)")
     logger.info("=" * 80)
     logger.info(f"🌐 WebSocket: ws://{host}:{ws_port}")
     logger.info(f"🌐 Web界面: http://{host}:{web_port}")
