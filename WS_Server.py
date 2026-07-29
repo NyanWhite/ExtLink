@@ -1,6 +1,7 @@
 ﻿# ws_server.py
 # 模块化存储 + 历史记录滑动窗口 + 可配置模块 + 多指标折线图（字段级智能单位转换 + 图表容器复用防重置）
-# 新增：基于电量变化率的剩余时间推算（优先于电流算法）
+# 新增：基于电量变化率的剩余时间推算（优先使用硬盘历史数据，若 save_history 开启）
+#      取消时间上限截断，正常显示任意大小时间
 
 import asyncio
 import json
@@ -423,6 +424,54 @@ class DeviceDataServer:
         self.last_history_entry.setdefault(client_id, {})[module] = current_data
         self._clean_history_file(history_file, max_seconds)
 
+    def _ensure_battery_cache_from_disk(self, client_id: str):
+        """
+        如果 save_history 为 True，尝试从磁盘加载电池历史数据填充缓存
+        """
+        if not CONFIG.get('save_history', False):
+            return
+        # 如果已有缓存且非空，则不重复加载
+        if client_id in self.battery_history_cache and len(self.battery_history_cache[client_id]) >= 2:
+            return
+
+        history_file_gz = os.path.join(DATA_DIR, client_id, "hs", "battery.history.gz")
+        history_file = os.path.join(DATA_DIR, client_id, "hs", "battery.history")
+        if not os.path.exists(history_file_gz) and not os.path.exists(history_file):
+            return
+
+        target_file = history_file_gz if os.path.exists(history_file_gz) else history_file
+        open_func = gzip.open if target_file.endswith('.gz') else open
+        entries = []
+        try:
+            with open_func(target_file, 'rt', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        ts = entry.get('timestamp')
+                        data = entry.get('data')
+                        if ts is not None and data is not None and isinstance(data, dict):
+                            level = data.get('level')
+                            if level is not None and 0 <= level <= 100:
+                                entries.append((ts, level))
+                    except:
+                        continue
+        except Exception as e:
+            logger.error(f"加载电池历史文件失败 {target_file}: {e}")
+            return
+
+        if not entries:
+            return
+        # 按时间排序
+        entries.sort(key=lambda x: x[0])
+        # 取最近最多30条
+        if len(entries) > 30:
+            entries = entries[-30:]
+        self.battery_history_cache[client_id] = entries
+        logger.debug(f"从磁盘加载电池历史 {client_id}: {len(entries)} 条记录")
+
     def save_data_to_file(self, client_id: str, data: Dict[str, Any]):
         try:
             # 根据充电状态反转电池电流符号
@@ -487,12 +536,16 @@ class DeviceDataServer:
         返回正数表示充电（上升），负数表示放电（下降）
         若数据不足或无效，返回 None
         """
+        # 如果 save_history 开启，尝试从磁盘加载历史数据
+        if CONFIG.get('save_history', False):
+            self._ensure_battery_cache_from_disk(client_id)
+
         cache = self.battery_history_cache.get(client_id)
         if not cache or len(cache) < 2:
             return None
 
         # 只取最近的数据点，但确保时间跨度至少30秒，避免噪声
-        # 简单：取最早和最晚两点计算平均速率
+        # 取最早和最晚两点计算平均速率
         first_ts, first_level = cache[0]
         last_ts, last_level = cache[-1]
         delta_ms = last_ts - first_ts
@@ -1249,7 +1302,7 @@ HTML_PAGE = """
             if (batteryRate !== undefined && batteryRate !== null && batteryRate !== 0 &&
                 batteryLevel !== '?' && batteryLevel >= 0 && batteryLevel <= 100) {
                 
-                var absRate = Math.abs(batteryRate); // 速率绝对值
+                var absRate = Math.abs(batteryRate);
                 var remainingPercent;
                 if (battery.charging) {
                     remainingPercent = 100 - batteryLevel;
@@ -1260,15 +1313,12 @@ HTML_PAGE = """
                 var remainingSeconds = remainingMinutes * 60;
 
                 if (isFinite(remainingSeconds) && remainingSeconds > 0) {
-                    if (remainingSeconds > 86400) { // > 24h
-                        batterySub = (battery.charging ? '⚡ 充电中' : '🔌 未充电') + ' - 剩余 > 24h (--:--:--)';
-                    } else {
-                        var endTime = new Date(Date.now() + remainingSeconds * 1000);
-                        var timeStr = formatDuration(remainingSeconds);
-                        var timePointStr = endTime.toTimeString().slice(0, 8);
-                        batterySub = (battery.charging ? '⚡ 充电中' : '🔌 未充电') + 
-                                     ' - 剩余 ' + timeStr + ' (' + timePointStr + ')';
-                    }
+                    // 不再限制最大值，直接显示
+                    var endTime = new Date(Date.now() + remainingSeconds * 1000);
+                    var timeStr = formatDuration(remainingSeconds);
+                    var timePointStr = endTime.toTimeString().slice(0, 8);
+                    batterySub = (battery.charging ? '⚡ 充电中' : '🔌 未充电') + 
+                                 ' - 剩余 ' + timeStr + ' (' + timePointStr + ')';
                 }
             } else {
                 // 回退到基于电流的算法（若存在）
@@ -1290,15 +1340,11 @@ HTML_PAGE = """
                     var remainingSeconds = remainingHours * 3600;
 
                     if (isFinite(remainingSeconds) && remainingSeconds > 0) {
-                        if (remainingSeconds > 86400) {
-                            batterySub = (battery.charging ? '⚡ 充电中' : '🔌 未充电') + ' - 剩余 > 24h (--:--:--)';
-                        } else {
-                            var endTime = new Date(Date.now() + remainingSeconds * 1000);
-                            var timeStr = formatDuration(remainingSeconds);
-                            var timePointStr = endTime.toTimeString().slice(0, 8);
-                            batterySub = (battery.charging ? '⚡ 充电中' : '🔌 未充电') + 
-                                         ' - 剩余 ' + timeStr + ' (' + timePointStr + ')';
-                        }
+                        var endTime = new Date(Date.now() + remainingSeconds * 1000);
+                        var timeStr = formatDuration(remainingSeconds);
+                        var timePointStr = endTime.toTimeString().slice(0, 8);
+                        batterySub = (battery.charging ? '⚡ 充电中' : '🔌 未充电') + 
+                                     ' - 剩余 ' + timeStr + ' (' + timePointStr + ')';
                     }
                 }
             }
