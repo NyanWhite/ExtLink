@@ -33,7 +33,7 @@ DEFAULT_CONFIG = {
     "ping_interval": 30,
     "ping_timeout": 60,
     "save_history": False,
-    "history_length": "1h",
+    "history_length": "1mo",
     "data_modules": [
         "battery",
         "network",
@@ -421,6 +421,19 @@ class DeviceDataServer:
 
     def save_data_to_file(self, client_id: str, data: Dict[str, Any]):
         try:
+            # 根据充电状态反转电池电流符号
+            if 'battery' in data and isinstance(data['battery'], dict):
+                if 'current' in data['battery']:
+                    cur = data['battery']['current']
+                    if isinstance(cur, (int, float)):
+                        charging = data['battery'].get('charging', False)
+                        if charging:
+                            # 充电时：取正（绝对值）
+                            data['battery']['current'] = abs(cur)
+                        else:
+                            # 放电时：取负（负绝对值）
+                            data['battery']['current'] = -abs(cur)
+
             device_dir = self._ensure_device_dir(client_id)
 
             if 'device' in data:
@@ -1473,7 +1486,7 @@ HTML_PAGE = """
 
 
 def get_html():
-    ws_port = CONFIG.get("ws_port", 32767)
+    ws_port = CONFIG.get("ws_port", 91)
     return HTML_PAGE.replace("{{WS_PORT}}", str(ws_port))
 
 
