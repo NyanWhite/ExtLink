@@ -1,5 +1,6 @@
 ﻿# ws_server.py
 # 模块化存储 + 历史记录滑动窗口 + 可配置模块 + 多指标折线图（字段级智能单位转换 + 图表容器复用防重置）
+# 新增：基于电量变化率的剩余时间推算（优先于电流算法）
 
 import asyncio
 import json
@@ -10,7 +11,7 @@ import sys
 import configparser
 import gzip
 from datetime import datetime
-from typing import Dict, Any, Optional, Set, List
+from typing import Dict, Any, Optional, Set, List, Tuple
 import websockets
 from aiohttp import web
 
@@ -130,6 +131,9 @@ class DeviceDataServer:
 
         # 历史记录缓存（用于精确去重）
         self.last_history_entry: Dict[str, Dict[str, Any]] = {}
+
+        # 电池历史缓存（用于计算变化率）: {device_id: [(timestamp_ms, level), ...]}
+        self.battery_history_cache: Dict[str, List[Tuple[int, int]]] = {}
 
     async def start(self):
         if self.running:
@@ -428,11 +432,21 @@ class DeviceDataServer:
                     if isinstance(cur, (int, float)):
                         charging = data['battery'].get('charging', False)
                         if charging:
-                            # 充电时：取正（绝对值）
                             data['battery']['current'] = abs(cur)
                         else:
-                            # 放电时：取负（负绝对值）
                             data['battery']['current'] = -abs(cur)
+
+                # ---- 更新电池历史缓存（用于变化率） ----
+                battery = data['battery']
+                level = battery.get('level')
+                if level is not None and level >= 0 and level <= 100:
+                    timestamp = data.get('timestamp', int(time.time() * 1000))
+                    cache = self.battery_history_cache.setdefault(client_id, [])
+                    cache.append((timestamp, level))
+                    # 仅保留最近30条
+                    if len(cache) > 30:
+                        cache = cache[-30:]
+                    self.battery_history_cache[client_id] = cache
 
             device_dir = self._ensure_device_dir(client_id)
 
@@ -467,6 +481,31 @@ class DeviceDataServer:
         except Exception as e:
             logger.error(f"❌ 保存数据失败 (设备 {client_id}): {e}")
 
+    def _calculate_battery_rate(self, client_id: str) -> Optional[float]:
+        """
+        基于历史缓存计算每分钟电量变化率（% / 分钟）
+        返回正数表示充电（上升），负数表示放电（下降）
+        若数据不足或无效，返回 None
+        """
+        cache = self.battery_history_cache.get(client_id)
+        if not cache or len(cache) < 2:
+            return None
+
+        # 只取最近的数据点，但确保时间跨度至少30秒，避免噪声
+        # 简单：取最早和最晚两点计算平均速率
+        first_ts, first_level = cache[0]
+        last_ts, last_level = cache[-1]
+        delta_ms = last_ts - first_ts
+        if delta_ms < 30000:  # 少于30秒，数据太密集，可能不稳定
+            return None
+        delta_min = delta_ms / 60000.0  # 转换为分钟
+        delta_level = last_level - first_level
+        rate = delta_level / delta_min
+        # 限制变化率绝对值最大为 50% / 分钟（防止突变）
+        if abs(rate) > 50:
+            rate = 50 if rate > 0 else -50
+        return rate
+
     def get_device_stats(self) -> Dict[str, Any]:
         now = time.time()
         stats = {
@@ -481,6 +520,9 @@ class DeviceDataServer:
             info = self.device_info.get(client_id, {})
             data_timestamp = data.get('timestamp', 0)
             network = data.get('network', {})
+
+            # 计算电池变化率
+            battery_rate = self._calculate_battery_rate(client_id)
 
             stats["devices"][client_id] = {
                 "last_seen": datetime.fromtimestamp(last_seen).isoformat() if last_seen else None,
@@ -497,6 +539,7 @@ class DeviceDataServer:
                 "screen_width": info.get('screen_width', 1080),
                 "screen_height": info.get('screen_height', 2400),
                 "first_seen": info.get('first_seen', 'Unknown'),
+                "battery_rate": battery_rate,  # 新增字段
                 "network": {
                     "type": network.get('type', '未知'),
                     "detail": network.get('detail', ''),
@@ -637,7 +680,7 @@ class DeviceDataServer:
         )
 
 
-# ==================== HTML页面（字段级智能单位转换 + 图表容器复用） ====================
+# ==================== HTML页面 ====================
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -826,37 +869,38 @@ HTML_PAGE = """
         } catch (e) { return ''; }
     }
 
+    // 辅助：将秒数格式化为 hh:mm:ss
+    function formatDuration(seconds) {
+        if (!seconds || seconds < 0 || !isFinite(seconds)) return '--:--:--';
+        var h = Math.floor(seconds / 3600);
+        var m = Math.floor((seconds % 3600) / 60);
+        var s = Math.floor(seconds % 60);
+        return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+    }
+
     // ==================== 智能单位转换（按字段名） ====================
     function transformField(module, field, values) {
-        // 返回 { data: 转换后的数组, unit: 单位字符串 }
         var raw = values;
         if (module === 'battery') {
-            // 电压 mV → V
             if (field === 'voltage') {
                 return { data: raw, unit: ' mV' };
             }
-            // 电流 µA → mA (假设原始是µA)
             if (field === 'current') {
                 return { data: raw.map(v => v !== null ? v / 1000 : null), unit: ' mA' };
             }
-            // 容量 mAh → Ah
             if (field === 'capacity') {
                 return { data: raw.map(v => v !== null ? v / 1000 : null), unit: ' Ah' };
             }
-            // 电量百分比，不缩放
             if (field === 'level') {
                 return { data: raw, unit: ' %' };
             }
-            // 温度 0.1°C → °C
             if (field === 'temperature') {
                 return { data: raw.map(v => v !== null ? v / 10 : null), unit: ' °C' };
             }
         }
-        // 网络模块特殊处理（由上层统一单位，此处原样返回）
         if (module === 'network' && (field === 'downSpeed' || field === 'upSpeed')) {
-            return { data: raw, unit: '' }; // 单位由外层统一处理
+            return { data: raw, unit: '' };
         }
-        // 其他字段：自动数值缩放（KB/MB/GB）
         return autoScaleByValue(raw);
     }
 
@@ -880,12 +924,9 @@ HTML_PAGE = """
         }
     }
 
-    // 网络流量统一单位：确保 downSpeed 和 upSpeed 使用相同单位 (KB/s 或 MB/s)
     function transformNetworkFields(fields, seriesData) {
-        // fields 是包含 downSpeed, upSpeed 等的数组
         var downRaw = seriesData['downSpeed'] || [];
         var upRaw = seriesData['upSpeed'] || [];
-        // 计算最大值，决定单位
         var maxVal = 0;
         var allVals = downRaw.concat(upRaw);
         for (var i=0; i<allVals.length; i++) {
@@ -896,7 +937,6 @@ HTML_PAGE = """
         var unit = ' B/s';
         if (maxVal > 1024*1024) { scale = 1/(1024*1024); unit = ' MB/s'; }
         else if (maxVal > 1024) { scale = 1/1024; unit = ' KB/s'; }
-        // 如果最大值小于1024，保持 B/s
         var transformed = {};
         fields.forEach(function(field) {
             var raw = seriesData[field] || [];
@@ -904,7 +944,6 @@ HTML_PAGE = """
                 var scaled = raw.map(function(v) { return v !== null ? v * scale : null; });
                 transformed[field] = { data: scaled, unit: unit };
             } else {
-                // 其他字段（如 signalLevel 等）单独处理
                 var result = autoScaleByValue(raw);
                 transformed[field] = { data: result.data, unit: result.unit };
             }
@@ -948,25 +987,21 @@ HTML_PAGE = """
             return;
         }
 
-        // ---- 智能转换 ----
         var transformedData = {};
         var seriesOptions = [];
 
         if (module === 'network') {
-            // 网络模块特殊处理：统一 downSpeed/upSpeed 单位
             var netTransformed = transformNetworkFields(fields, inst.seriesData.fields);
             fields.forEach(function(field) {
                 var item = netTransformed[field];
                 if (item) {
                     transformedData[field] = item;
                 } else {
-                    // fallback
                     var raw = inst.seriesData.fields[field];
                     var result = autoScaleByValue(raw);
                     transformedData[field] = result;
                 }
             });
-            // 构建 series
             fields.forEach(function(field) {
                 var item = transformedData[field];
                 seriesOptions.push({
@@ -980,7 +1015,6 @@ HTML_PAGE = """
                 });
             });
         } else {
-            // 其他模块：逐字段转换
             fields.forEach(function(field) {
                 var raw = inst.seriesData.fields[field];
                 var result = transformField(module, field, raw);
@@ -997,7 +1031,6 @@ HTML_PAGE = """
             });
         }
 
-        // 图例数据（带单位）
         var legendData = fields.map(function(field) {
             return field + (transformedData[field] ? transformedData[field].unit : '');
         });
@@ -1075,7 +1108,6 @@ HTML_PAGE = """
             }
         });
 
-        // 重新转换并更新
         var timestamps = seriesData.timestamps;
         var fields2 = Object.keys(seriesData.fields);
         var transformedData = {};
@@ -1168,7 +1200,7 @@ HTML_PAGE = """
         loadHistory(deviceId, module);
     }
 
-    // ==================== 渲染设备（复用图表容器） ====================
+    // ==================== 渲染设备 ====================
     function renderDevices(stats) {
         var container = document.getElementById('devicesContainer');
         if (!container) return;
@@ -1185,7 +1217,6 @@ HTML_PAGE = """
             return;
         }
 
-        // 保存旧图表容器
         var savedCharts = {};
         var existingRows = container.querySelectorAll('.device-row');
         existingRows.forEach(function(row) {
@@ -1209,6 +1240,68 @@ HTML_PAGE = """
             var battery = dev.battery || {};
             var batteryLevel = battery.level !== undefined ? battery.level : '?';
             var batteryClass = batteryLevel >= 50 ? 'good' : (batteryLevel >= 20 ? 'warning' : 'danger');
+
+            // ---- 电池剩余时间推算 ----
+            var batterySub = battery.charging ? '⚡ 充电中' : '🔌 未充电';
+            var batteryRate = dev.battery_rate; // 来自服务器，单位 %/分钟，正=充电，负=放电
+
+            // 优先使用基于变化率的算法
+            if (batteryRate !== undefined && batteryRate !== null && batteryRate !== 0 &&
+                batteryLevel !== '?' && batteryLevel >= 0 && batteryLevel <= 100) {
+                
+                var absRate = Math.abs(batteryRate); // 速率绝对值
+                var remainingPercent;
+                if (battery.charging) {
+                    remainingPercent = 100 - batteryLevel;
+                } else {
+                    remainingPercent = batteryLevel;
+                }
+                var remainingMinutes = remainingPercent / absRate;
+                var remainingSeconds = remainingMinutes * 60;
+
+                if (isFinite(remainingSeconds) && remainingSeconds > 0) {
+                    if (remainingSeconds > 86400) { // > 24h
+                        batterySub = (battery.charging ? '⚡ 充电中' : '🔌 未充电') + ' - 剩余 > 24h (--:--:--)';
+                    } else {
+                        var endTime = new Date(Date.now() + remainingSeconds * 1000);
+                        var timeStr = formatDuration(remainingSeconds);
+                        var timePointStr = endTime.toTimeString().slice(0, 8);
+                        batterySub = (battery.charging ? '⚡ 充电中' : '🔌 未充电') + 
+                                     ' - 剩余 ' + timeStr + ' (' + timePointStr + ')';
+                    }
+                }
+            } else {
+                // 回退到基于电流的算法（若存在）
+                var batteryCurrent = battery.current;
+                var batteryCapacity = battery.capacity;
+                if (batteryCurrent !== undefined && batteryCurrent !== null && batteryCurrent !== 0 &&
+                    batteryCapacity !== undefined && batteryCapacity !== null && batteryCapacity > 0 &&
+                    batteryLevel !== '?' && batteryLevel >= 0 && batteryLevel <= 100) {
+                    
+                    var currentMa = Math.abs(batteryCurrent) / 1000;
+                    var remainingPercent;
+                    if (battery.charging) {
+                        remainingPercent = 100 - batteryLevel;
+                    } else {
+                        remainingPercent = batteryLevel;
+                    }
+                    var remainingCapacity = batteryCapacity * (remainingPercent / 100);
+                    var remainingHours = remainingCapacity / currentMa;
+                    var remainingSeconds = remainingHours * 3600;
+
+                    if (isFinite(remainingSeconds) && remainingSeconds > 0) {
+                        if (remainingSeconds > 86400) {
+                            batterySub = (battery.charging ? '⚡ 充电中' : '🔌 未充电') + ' - 剩余 > 24h (--:--:--)';
+                        } else {
+                            var endTime = new Date(Date.now() + remainingSeconds * 1000);
+                            var timeStr = formatDuration(remainingSeconds);
+                            var timePointStr = endTime.toTimeString().slice(0, 8);
+                            batterySub = (battery.charging ? '⚡ 充电中' : '🔌 未充电') + 
+                                         ' - 剩余 ' + timeStr + ' (' + timePointStr + ')';
+                        }
+                    }
+                }
+            }
 
             var foreground = dev.foreground || {};
             var fgTitle = foreground.windowTitle || foreground.packageName || 'Unknown';
@@ -1273,7 +1366,7 @@ HTML_PAGE = """
             if (netSignalLevel) netTypeDisplay += ' 信号: ' + netSignalLevel;
 
             var dataItems = [
-                { label: '🔋 电池', value: batteryLevel + '%', sub: battery.charging ? '⚡ 充电中' : '🔌 未充电', cls: batteryClass, module: 'battery' },
+                { label: '🔋 电池', value: batteryLevel + '%', sub: batterySub, cls: batteryClass, module: 'battery' },
                 { label: '💾 内存', value: memoryUsedMB + ' / ' + memoryMB + ' MB', sub: '使用 ' + memoryPercent + '%', module: 'memory' },
                 { label: '💾 存储', value: storageUsedGB + ' / ' + storageGB + ' GB', sub: '使用 ' + storagePercent + '%', module: 'storage' },
                 { label: '📱 前台', value: fgTitle, sub: fgApp, module: 'foreground' },
@@ -1358,7 +1451,7 @@ HTML_PAGE = """
         }
         container.innerHTML = html;
 
-        // 恢复保存的图表容器
+        // 恢复图表容器
         var newRows = container.querySelectorAll('.device-row');
         newRows.forEach(function(row) {
             var cid = row.getAttribute('data-client-id');
@@ -1382,7 +1475,6 @@ HTML_PAGE = """
             }
         });
 
-        // 清理不存在的图表实例
         var currentIds = {};
         newRows.forEach(function(row) {
             var cid = row.getAttribute('data-client-id');
@@ -1395,13 +1487,9 @@ HTML_PAGE = """
             }
         }
 
-        // 恢复已有图表的 option（但需要重新应用转换？如果之前已加载数据，则重新渲染可保持状态）
-        // 由于我们只移动容器，图表实例中的 seriesData 还在，但可能需要重新应用转换（因为转换规则可能不变）
-        // 但为了保留缩放状态，我们只 resize，option 不变
         for (var id in chartInstances) {
             var inst = chartInstances[id];
             if (inst.currentModule && inst.seriesData.timestamps.length > 0) {
-                // 确保容器存在
                 var containerId = 'chart-' + id.replace(/[^a-zA-Z0-9]/g, '_');
                 var el = document.getElementById(containerId);
                 if (el && inst.chart) {
@@ -1478,7 +1566,7 @@ HTML_PAGE = """
     }
 
     connectWebSocket();
-    console.log('📱 DeviceMonitor (智能单位转换, 图表容器复用) 已启动');
+    console.log('📱 DeviceMonitor (智能单位转换, 图表容器复用, 电池剩余时间-变化率算法) 已启动');
 </script>
 </body>
 </html>
@@ -1584,7 +1672,7 @@ async def main():
     host = CONFIG.get("host", "0.0.0.0")
 
     logger.info("=" * 80)
-    logger.info("📱 设备数据接收服务器 v15.3 (智能单位转换)")
+    logger.info("📱 设备数据接收服务器 v15.3 (智能单位转换 + 电量变化率推算)")
     logger.info("=" * 80)
     logger.info(f"🌐 WebSocket: ws://{host}:{ws_port}")
     logger.info(f"🌐 Web界面: http://{host}:{web_port}")
