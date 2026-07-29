@@ -1,5 +1,6 @@
 // device_collector.js
-// 修复版 - 传感器数据更新频率可配置 + 前台应用获取修复 + 网络监控（无IP版本）
+// 增强版 - 电池详细信息（电压/电流/容量）+ 应用名称（非包名）
+// 支持 AutoJS 自身与 Shizuku 双通道获取
 
 "auto";
 
@@ -10,6 +11,10 @@ try {
     importClass(android.net.ConnectivityManager);
     importClass(android.net.NetworkInfo);
     importClass(android.net.TrafficStats);
+    importClass(android.os.BatteryManager);
+    importClass(android.content.Intent);
+    importClass(android.content.IntentFilter);
+    importClass(android.content.pm.PackageManager);
 } catch(e) {
     // 部分版本可能不支持
 }
@@ -160,7 +165,6 @@ function getNetworkType() {
                 if (wifiManager) {
                     var wifiInfo = wifiManager.getConnectionInfo();
                     if (wifiInfo) {
-                        // 只获取信号强度，不获取 SSID
                         try {
                             var rssi = wifiInfo.getRssi();
                             if (rssi !== undefined && rssi !== null) {
@@ -370,20 +374,20 @@ var SCREEN_INFO = getScreenInfo();
 
 var CONFIG = {
     "deviceId": DEVICE_ID,
-    "wsServer": "localhost:80",
-    "updateInterval": 5,  // 数据上传间隔（秒）
-    "collectBasicInfo": false,
-    "collectBattery": false,
-    "collectForegroundApp": false,
-    "collectMemory": false,
-    "collectScreenState": false,
-    "collectStorageInfo": false,
-    "collectCpuInfo": false,
+    "wsServer": "localhost:91",
+    "updateInterval": 1,  // 数据上传间隔（秒）
+    "collectBasicInfo": true,
+    "collectBattery": true,   // 开启以测试电池详细数据
+    "collectForegroundApp": true, // 开启以测试应用名称
+    "collectMemory": true,
+    "collectScreenState": true,
+    "collectStorageInfo": true,
+    "collectCpuInfo": true,
     "collectLocation": false,
-    "collectSensor": false,
-    "collectProcesses": false,
-    "collectPackages": false,
-    "collectNetwork": false  // 网络监控开关
+    "collectSensor": true,
+    "collectProcesses": true,
+    "collectPackages": true,
+    "collectNetwork": true  // 网络监控开关
 };
 
 // ==================== 打印设备信息 ====================
@@ -467,7 +471,162 @@ function execShell(cmd) {
     }
 }
 
-// ==================== 获取前台应用（增强版） ====================
+// ==================== Shizuku 执行（adb 模式） ====================
+function execShizuku(cmd) {
+    try {
+        var result = shell(cmd, { adb: true });
+        if (result && result.code === 0) {
+            return result.stdout.toString().trim();
+        } else {
+            return null;
+        }
+    } catch (e) {
+        return null;
+    }
+}
+
+// ==================== 获取应用名称（通过包名） ====================
+function getAppLabel(pkg) {
+    if (!pkg || pkg === "Unknown" || pkg === "") return "Unknown";
+    try {
+        var pm = context.getPackageManager();
+        var appInfo = pm.getApplicationInfo(pkg, 0);
+        return pm.getApplicationLabel(appInfo).toString();
+    } catch(e) {
+        return "Unknown";
+    }
+}
+
+// ==================== 电池详细信息（双通道） ====================
+
+/**
+ * 通过 AutoJS 自身 API 获取电池数据
+ */
+function getBatteryDetailsAutoJS() {
+    var info = {
+        voltage: null,
+        current: null,
+        capacity: null,
+        level: null,
+        temperature: null,
+        health: null,
+        status: null
+    };
+    try {
+        // 使用 BatteryManager
+        var batteryManager = context.getSystemService(context.BATTERY_SERVICE);
+        var intent = context.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (intent) {
+            info.level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+            var scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+            if (info.level >= 0 && scale > 0) {
+                info.level = Math.round(info.level * 100 / scale);
+            }
+            info.voltage = intent.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1);
+            info.temperature = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1);
+            info.status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+            info.health = intent.getIntExtra(BatteryManager.EXTRA_HEALTH, -1);
+        }
+        // 尝试获取电流和容量（可能需要 Android 5.0+）
+        if (batteryManager && batteryManager.getIntProperty) {
+            try {
+                var current = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW);
+                if (current !== 0) info.current = current;
+            } catch(e) {}
+            try {
+                var capacity = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER);
+                if (capacity !== 0) info.capacity = capacity;
+            } catch(e) {}
+        }
+    } catch(e) {
+        log("AutoJS电池获取异常: " + e.message);
+    }
+    return info;
+}
+
+/**
+ * 通过 Shizuku（dumpsys + sysfs）获取电池数据
+ */
+function getBatteryDetailsShizuku() {
+    var info = {
+        voltage: null,
+        current: null,
+        capacity: null,
+        level: null,
+        temperature: null,
+        health: null,
+        status: null
+    };
+    try {
+        // 1. dumpsys battery
+        var output = execShizuku("dumpsys battery");
+        if (output) {
+            var lines = output.split("\n");
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i].trim();
+                if (line.indexOf("voltage") >= 0) {
+                    var match = line.match(/\d+/);
+                    if (match) info.voltage = parseInt(match[0]);
+                } else if (line.indexOf("level") >= 0) {
+                    var match = line.match(/\d+/);
+                    if (match) info.level = parseInt(match[0]);
+                } else if (line.indexOf("temperature") >= 0) {
+                    var match = line.match(/\d+/);
+                    if (match) info.temperature = parseInt(match[0]);
+                } else if (line.indexOf("status") >= 0) {
+                    var match = line.match(/\d+/);
+                    if (match) info.status = parseInt(match[0]);
+                } else if (line.indexOf("health") >= 0) {
+                    var match = line.match(/\d+/);
+                    if (match) info.health = parseInt(match[0]);
+                }
+            }
+        }
+        // 2. 从 sysfs 读取电流和容量
+        var currentRaw = execShizuku("cat /sys/class/power_supply/battery/current_now 2>/dev/null");
+        if (currentRaw && currentRaw.match(/^\d+$/)) {
+            info.current = parseInt(currentRaw);
+        }
+        var capacityRaw = execShizuku("cat /sys/class/power_supply/battery/charge_full 2>/dev/null");
+        if (capacityRaw && capacityRaw.match(/^\d+$/)) {
+            info.capacity = parseInt(capacityRaw);
+        }
+    } catch(e) {
+        log("Shizuku电池获取异常: " + e.message);
+    }
+    return info;
+}
+
+/**
+ * 合并两种方式，优先使用 Shizuku 数据（更准确），若缺失则补充 AutoJS 数据
+ */
+function getBatteryDetails() {
+    var autoData = getBatteryDetailsAutoJS();
+    var shizukuData = getBatteryDetailsShizuku();
+    
+    // 合并：优先使用 shizuku 的非空值，否则使用 autoData
+    var result = {};
+    var keys = ["voltage", "current", "capacity", "level", "temperature", "health", "status"];
+    for (var i = 0; i < keys.length; i++) {
+        var key = keys[i];
+        var shizVal = shizukuData[key];
+        var autoVal = autoData[key];
+        // 如果 shizuku 有有效值（非 null, 非 -1 或非 0 对于电流容量），则使用
+        if (shizVal !== null && shizVal !== undefined && shizVal !== -1 && shizVal !== 0) {
+            result[key] = shizVal;
+        } else if (autoVal !== null && autoVal !== undefined && autoVal !== -1) {
+            result[key] = autoVal;
+        } else {
+            result[key] = null;
+        }
+    }
+    // 日志输出对比（便于调试）
+    log("🔋 电池信息对比: AutoJS[电压=" + autoData.voltage + "mV, 电流=" + autoData.current + "μA, 容量=" + autoData.capacity + "mAh, 电量=" + autoData.level + "%]");
+    log("🔋 Shizuku[电压=" + shizukuData.voltage + "mV, 电流=" + shizukuData.current + "μA, 容量=" + shizukuData.capacity + "mAh, 电量=" + shizukuData.level + "%]");
+    return result;
+}
+
+// ==================== 获取前台应用（增强版：包含应用名称） ====================
 function getForegroundApp() {
     var pkg = "Unknown";
     var act = "Unknown";
@@ -559,11 +718,15 @@ function getForegroundApp() {
         }
     }
 
+    // 获取应用名称（标签）
+    var appName = getAppLabel(pkg);
+
     return {
         packageName: pkg,
         activity: act,
         source: source,
-        isAutoJsService: !!auto.service
+        isAutoJsService: !!auto.service,
+        appName: appName   // 新增字段
     };
 }
 
@@ -721,40 +884,28 @@ function collectAllData() {
         } catch (e) {}
     }
 
-    // ===== 电池信息 =====
+    // ===== 电池信息（增强版） =====
     if (CONFIG.collectBattery) {
-        var battery = { level: -1, charging: false, temperature: -1, voltage: -1, health: "Unknown" };
-        try {
-            if (typeof device.getBattery === 'function') {
-                battery.level = device.getBattery();
-            }
-        } catch (e) {}
-        try {
-            if (typeof device.isCharging === 'function') {
-                battery.charging = device.isCharging();
-            }
-        } catch (e) {}
-        try {
-            if (typeof device.getBatteryTemperature === 'function') {
-                var temp = device.getBatteryTemperature();
-                if (temp > 0) battery.temperature = temp;
-            }
-        } catch (e) {}
-        try {
-            if (typeof device.getBatteryVoltage === 'function') {
-                var volt = device.getBatteryVoltage();
-                if (volt > 0) battery.voltage = volt;
-            }
-        } catch (e) {}
-        try {
-            if (typeof device.getBatteryHealth === 'function') {
-                battery.health = device.getBatteryHealth();
-            }
-        } catch (e) {}
+        var batteryDetail = getBatteryDetails();
+        var battery = {
+            level: batteryDetail.level !== null ? batteryDetail.level : -1,
+            charging: false,  // 保留原字段，可通过status判断
+            temperature: batteryDetail.temperature !== null ? batteryDetail.temperature : -1,
+            voltage: batteryDetail.voltage !== null ? batteryDetail.voltage : -1,
+            health: batteryDetail.health !== null ? batteryDetail.health : "Unknown",
+            // 新增字段
+            current: batteryDetail.current !== null ? batteryDetail.current : -1,
+            capacity: batteryDetail.capacity !== null ? batteryDetail.capacity : -1,
+            status: batteryDetail.status !== null ? batteryDetail.status : -1
+        };
+        // 判断是否充电
+        if (battery.status !== -1) {
+            battery.charging = (battery.status === 2 || battery.status === 5); // 2=充电中, 5=已充满
+        }
         data.battery = battery;
     }
 
-    // ===== 前台应用 =====
+    // ===== 前台应用（含应用名称） =====
     if (CONFIG.collectForegroundApp) {
         data.foreground = getForegroundApp();
     }
@@ -1020,6 +1171,13 @@ globalThis.collectData = function() {
     if (data.foreground) {
         log("  📱 前台: " + data.foreground.packageName + " (" + data.foreground.source + ")");
         log("  📱 Activity: " + data.foreground.activity);
+        log("  📱 应用名称: " + data.foreground.appName);
+    }
+    if (data.battery) {
+        log("  🔋 电量: " + data.battery.level + "%" + (data.battery.charging ? " (充电中)" : ""));
+        if (data.battery.voltage > 0) log("  🔋 电压: " + data.battery.voltage + "mV");
+        if (data.battery.current > 0) log("  🔋 电流: " + data.battery.current + "μA");
+        if (data.battery.capacity > 0) log("  🔋 容量: " + data.battery.capacity + "mAh");
     }
     if (data.location && data.location.hasLocation) {
         log("  📍 GPS: " + data.location.latitude + ", " + data.location.longitude);
@@ -1092,7 +1250,7 @@ globalThis.stop = function() {
 
 // ==================== 主程序 ====================
 log("=".repeat(60));
-log("📱 设备收集 v11.0 (网络监控版 - 无IP)");
+log("📱 设备收集 v11.1 (电池增强+应用名称)");
 log("=".repeat(60));
 log("📋 设备ID: " + CONFIG.deviceId);
 if (MARKET_NAME) {
@@ -1138,9 +1296,15 @@ try {
     if (test.device) {
         log("  📱 " + test.device.model);
     }
-    if (test.battery) log("  🔋 " + test.battery.level + "%" + (test.battery.charging ? " (充电中)" : ""));
+    if (test.battery) {
+        log("  🔋 电量: " + test.battery.level + "%" + (test.battery.charging ? " (充电中)" : ""));
+        if (test.battery.voltage > 0) log("  🔋 电压: " + test.battery.voltage + "mV");
+        if (test.battery.current > 0) log("  🔋 电流: " + test.battery.current + "μA");
+        if (test.battery.capacity > 0) log("  🔋 容量: " + test.battery.capacity + "mAh");
+    }
     if (test.foreground) {
-        log("  📱 前台: " + test.foreground.packageName + " (来源: " + test.foreground.source + ")");
+        log("  📱 前台包名: " + test.foreground.packageName + " (来源: " + test.foreground.source + ")");
+        log("  📱 应用名称: " + test.foreground.appName);
         if (test.foreground.activity && test.foreground.activity !== "Unknown") {
             log("  📱 Activity: " + test.foreground.activity);
         }

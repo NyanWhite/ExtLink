@@ -1,9 +1,20 @@
 {
-    "ws_port": 81,
+    "ws_port": 91,
     "web_port": 80,
     "host": "0.0.0.0",
     "data_dir": "device_data",
     "log_level": 0,
     "ping_interval": 30,
-    "ping_timeout": 60
+    "ping_timeout": 60,
+    "save_history": true,
+    "history_length": "1h",
+    "data_modules": [
+        "battery",
+        "network",
+        "screen",
+        "sensors",
+        "location",
+        "memory",
+        "storage"
+    ]
 }

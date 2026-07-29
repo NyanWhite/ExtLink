@@ -1,5 +1,5 @@
 ﻿# ws_server.py
-# 实时推送版 + 终端命令 + 配置文件心跳参数
+# 模块化存储 + 历史记录滑动窗口 + 可配置模块 + 多指标折线图（字段级智能单位转换 + 图表容器复用防重置）
 
 import asyncio
 import json
@@ -7,11 +7,14 @@ import logging
 import time
 import os
 import sys
+import configparser
+import gzip
 from datetime import datetime
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional, Set, List
 import websockets
+from aiohttp import web
 
-# 配置日志（后续会根据配置文件调整级别）
+# 配置日志
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -22,17 +25,50 @@ logger = logging.getLogger(__name__)
 # ==================== 配置文件 ====================
 CONFIG_FILE = "server_config.json"
 DEFAULT_CONFIG = {
-    "ws_port": 32767,
-    "web_port": 8080,
+    "ws_port": 91,
+    "web_port": 80,
     "host": "0.0.0.0",
     "data_dir": "device_data",
-    "log_level": 0,          # 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR
-    "ping_interval": 30,     # WebSocket 心跳间隔（秒）
-    "ping_timeout": 60       # WebSocket 心跳超时（秒）
+    "log_level": 0,
+    "ping_interval": 30,
+    "ping_timeout": 60,
+    "save_history": False,
+    "history_length": "1h",
+    "data_modules": [
+        "battery",
+        "network",
+        "foreground",
+        "screen",
+        "sensors",
+        "location",
+        "memory",
+        "storage"
+    ]
 }
 
+
+def parse_history_length(length_str: str) -> int:
+    if not length_str:
+        return 3600
+    length_str = length_str.strip().lower()
+    try:
+        if length_str.endswith('s'):
+            return int(length_str[:-1])
+        elif length_str.endswith('m'):
+            return int(length_str[:-1]) * 60
+        elif length_str.endswith('h'):
+            return int(length_str[:-1]) * 3600
+        elif length_str.endswith('mo'):
+            return int(length_str[:-2]) * 30 * 24 * 3600
+        elif length_str.endswith('y'):
+            return int(length_str[:-1]) * 365 * 24 * 3600
+        else:
+            return int(length_str)
+    except ValueError:
+        return 3600
+
+
 def load_config():
-    """强制加载外部配置文件，若文件不存在或格式错误则抛出异常"""
     if not os.path.exists(CONFIG_FILE):
         raise FileNotFoundError(f"配置文件 {CONFIG_FILE} 不存在，请创建并配置。")
     try:
@@ -40,34 +76,38 @@ def load_config():
             config = json.load(f)
     except json.JSONDecodeError as e:
         raise ValueError(f"配置文件 {CONFIG_FILE} 格式错误: {e}")
-    # 补全缺失的键
     for key in DEFAULT_CONFIG:
         if key not in config:
             logger.warning(f"配置项 '{key}' 缺失，使用默认值: {DEFAULT_CONFIG[key]}")
             config[key] = DEFAULT_CONFIG[key]
+    if not isinstance(config.get('data_modules'), list):
+        config['data_modules'] = DEFAULT_CONFIG['data_modules']
     return config
 
+
 def set_log_level(level_code: int):
-    """根据等级代码设置日志级别"""
     level_map = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING, 3: logging.ERROR}
     level = level_map.get(level_code, logging.DEBUG)
     logging.getLogger().setLevel(level)
     logger.info(f"日志级别设置为: {logging.getLevelName(level)} (代码 {level_code})")
 
-# 加载配置，若失败则退出
+
+# 加载配置
 try:
     CONFIG = load_config()
 except (FileNotFoundError, ValueError) as e:
     logger.error(f"配置加载失败: {e}")
     sys.exit(1)
 
-# 设置日志级别
 set_log_level(CONFIG.get("log_level", 0))
+
+DATA_MODULES = CONFIG.get('data_modules', DEFAULT_CONFIG['data_modules'])
 
 DATA_DIR = CONFIG.get("data_dir", "device_data")
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
     logger.info(f"📁 数据存储目录: {DATA_DIR}")
+    logger.info(f"📦 数据模块: {', '.join(DATA_MODULES)}")
 except Exception as e:
     logger.error(f"❌ 创建数据目录失败: {e}")
     DATA_DIR = "."
@@ -86,17 +126,20 @@ class DeviceDataServer:
         self.websocket_server = None
         self.stop_event = asyncio.Event()
 
+        self.device_ini_cache: Dict[str, Dict] = {}
+
+        # 历史记录缓存（用于精确去重）
+        self.last_history_entry: Dict[str, Dict[str, Any]] = {}
+
     async def start(self):
-        """启动 WebSocket 服务器，阻塞直到收到停止信号"""
         if self.running:
             logger.warning("服务器已经在运行，忽略")
             return
 
-        # 重置停止事件，避免上次的信号影响
         self.stop_event.clear()
         self.running = True
 
-        ws_port = CONFIG.get("ws_port", 32767)
+        ws_port = CONFIG.get("ws_port", 91)
         host = CONFIG.get("host", "0.0.0.0")
         ping_interval = CONFIG.get("ping_interval", 30)
         ping_timeout = CONFIG.get("ping_timeout", 60)
@@ -116,19 +159,16 @@ class DeviceDataServer:
             self.running = False
             raise e
 
-        # 等待停止信号或服务器关闭
         stop_task = asyncio.create_task(self.stop_event.wait())
         close_task = asyncio.create_task(self.websocket_server.wait_closed())
         await asyncio.wait(
             [stop_task, close_task],
             return_when=asyncio.FIRST_COMPLETED
         )
-        # 取消未完成的任务
         for task in (stop_task, close_task):
             if not task.done():
                 task.cancel()
 
-        # 关闭服务器
         if self.websocket_server:
             self.websocket_server.close()
             await self.websocket_server.wait_closed()
@@ -137,24 +177,18 @@ class DeviceDataServer:
         logger.info("WebSocket 服务器已停止")
 
     async def stop(self):
-        """停止服务器，等待完全关闭"""
         if not self.running:
-            logger.debug("服务器已经停止")
             return
-
         logger.info("正在停止 WebSocket 服务器...")
         self.stop_event.set()
-        # 等待 start 完全退出
         while self.running:
             await asyncio.sleep(0.05)
-        # 确保服务器完全关闭
         if self.websocket_server:
             self.websocket_server.close()
             await self.websocket_server.wait_closed()
         logger.info("WebSocket 服务器已完全停止")
 
     async def handle_client(self, websocket: websockets.WebSocketServerProtocol):
-        """处理新连接（区分设备或网页）"""
         try:
             message = await asyncio.wait_for(websocket.recv(), timeout=10.0)
             try:
@@ -174,16 +208,16 @@ class DeviceDataServer:
         except asyncio.TimeoutError:
             logger.warning("连接超时，未收到初始消息")
             await websocket.close()
-        except websockets.exceptions.ConnectionClosed:
-            pass
         except Exception as e:
             logger.error(f"处理连接时出错: {e}")
 
     async def handle_device(self, websocket: websockets.WebSocketServerProtocol, init_data: dict):
-        """处理设备客户端"""
         client_id = init_data.get('deviceId', str(id(websocket)))
         self.device_clients[client_id] = websocket
         self.device_last_seen[client_id] = time.time()
+
+        # 清空该设备的历史缓存，确保新连接的第一条数据被记录
+        self.last_history_entry.pop(client_id, None)
 
         if client_id not in self.device_info:
             self.device_info[client_id] = {
@@ -192,6 +226,9 @@ class DeviceDataServer:
                 "device_manufacturer": init_data.get('device', {}).get('manufacturer', 'Unknown'),
             }
         logger.info(f"📱 设备 {client_id} 连接成功")
+
+        self._ensure_device_dir(client_id)
+        self.device_ini_cache[client_id] = self._load_device_ini(client_id)
 
         try:
             await websocket.send(json.dumps({
@@ -210,22 +247,26 @@ class DeviceDataServer:
         finally:
             self.device_clients.pop(client_id, None)
             self.device_last_seen.pop(client_id, None)
+            self.device_ini_cache.pop(client_id, None)
 
     async def handle_web(self, websocket: websockets.WebSocketServerProtocol):
-        """处理网页客户端"""
         self.web_clients.add(websocket)
         logger.info(f"🌐 网页客户端连接 (当前 {len(self.web_clients)} 个)")
         await self.send_stats_to_web(websocket)
         try:
-            await websocket.wait_closed()
+            async for message in websocket:
+                # Web客户端不再发送history_request，全部改为HTTP
+                pass
         except:
             pass
         finally:
             self.web_clients.discard(websocket)
             logger.info(f"🌐 网页客户端断开 (剩余 {len(self.web_clients)} 个)")
 
+    def _extract_value(self, module: str, data: dict) -> Optional[float]:
+        return None
+
     async def process_message(self, client_id: str, message: str):
-        """处理设备发来的消息"""
         try:
             data = json.loads(message)
             data_type = data.get('dataType', 'unknown')
@@ -252,8 +293,6 @@ class DeviceDataServer:
                 await self.handle_partial_data(client_id, data)
 
             await self.broadcast_stats()
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON解析错误: {e}")
         except Exception as e:
             logger.error(f"处理消息时出错: {e}")
 
@@ -263,17 +302,159 @@ class DeviceDataServer:
     async def handle_partial_data(self, client_id: str, data: Dict[str, Any]):
         logger.debug(f"📥 收到设备 {client_id} 的增量数据")
 
+    def _ensure_device_dir(self, client_id: str) -> str:
+        device_dir = os.path.join(DATA_DIR, client_id)
+        os.makedirs(device_dir, exist_ok=True)
+        hs_dir = os.path.join(device_dir, "hs")
+        os.makedirs(hs_dir, exist_ok=True)
+        return device_dir
+
+    def _load_device_ini(self, client_id: str) -> Dict:
+        device_dir = os.path.join(DATA_DIR, client_id)
+        ini_file = os.path.join(device_dir, "historySet.ini")
+
+        default_sections = ['device'] + DATA_MODULES
+        default_config = {}
+        for sec in default_sections:
+            default_config[sec] = {'save_history': -1, 'history_length': -1}
+
+        if not os.path.exists(ini_file):
+            config = configparser.ConfigParser()
+            for sec, values in default_config.items():
+                config[sec] = {k: str(v) for k, v in values.items()}
+            with open(ini_file, 'w', encoding='utf-8') as f:
+                config.write(f)
+            logger.debug(f"📝 创建历史配置文件: {ini_file}")
+            return default_config
+
+        config = configparser.ConfigParser()
+        config.read(ini_file, encoding='utf-8')
+        result = {}
+        for sec in default_sections:
+            result[sec] = {}
+            for key in default_config[sec].keys():
+                try:
+                    val = config.get(sec, key)
+                    try:
+                        val = int(val)
+                    except ValueError:
+                        pass
+                    result[sec][key] = val
+                except:
+                    result[sec][key] = default_config[sec][key]
+        return result
+
+    def _get_module_history_settings(self, client_id: str, module: str):
+        global_save = CONFIG.get('save_history', False)
+        global_length_str = CONFIG.get('history_length', '1h')
+        global_seconds = parse_history_length(global_length_str)
+
+        ini = self.device_ini_cache.get(client_id, {})
+        mod_cfg = ini.get(module, {})
+
+        mod_save = mod_cfg.get('save_history', -1)
+        mod_length = mod_cfg.get('history_length', -1)
+
+        final_save = global_save if mod_save == -1 else bool(mod_save)
+        if mod_length == -1:
+            final_seconds = global_seconds
+        else:
+            final_seconds = parse_history_length(str(mod_length))
+
+        return final_save, final_seconds
+
+    def _clean_history_file(self, history_file: str, max_age_seconds: int):
+        if not os.path.exists(history_file):
+            return
+        
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - (max_age_seconds * 1000)
+
+        try:
+            lines = []
+            open_func = gzip.open if history_file.endswith('.gz') else open
+            with open_func(history_file, 'rt', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if entry.get('timestamp', 0) >= cutoff_ms:
+                            lines.append(line)
+                    except:
+                        continue
+            write_open = gzip.open if history_file.endswith('.gz') else open
+            with write_open(history_file, 'wt', encoding='utf-8') as f:
+                if lines:
+                    f.write('\n'.join(lines) + '\n')
+                else:
+                    f.write('')
+        except Exception as e:
+            logger.error(f"清理历史文件失败 {history_file}: {e}")
+
+    def _save_history_entry(self, client_id: str, module: str, entry: dict):
+        last_data = self.last_history_entry.get(client_id, {}).get(module)
+        current_data = entry.get('data')
+        if current_data is not None and last_data is not None and current_data == last_data:
+            logger.debug(f"⏭️  跳过重复历史记录: {client_id}/{module}")
+            return
+
+        save_flag, max_seconds = self._get_module_history_settings(client_id, module)
+        if not save_flag:
+            return
+
+        device_dir = os.path.join(DATA_DIR, client_id)
+        hs_dir = os.path.join(device_dir, "hs")
+        os.makedirs(hs_dir, exist_ok=True)
+        history_file = os.path.join(hs_dir, f"{module}.history.gz")
+
+        try:
+            with gzip.open(history_file, 'at', encoding='utf-8') as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        except Exception as e:
+            logger.error(f"写入历史记录失败 {module}: {e}")
+            return
+
+        self.last_history_entry.setdefault(client_id, {})[module] = current_data
+        self._clean_history_file(history_file, max_seconds)
+
     def save_data_to_file(self, client_id: str, data: Dict[str, Any]):
         try:
-            filename = f"device_{client_id}.json"
-            filepath = os.path.join(DATA_DIR, filename)
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            device_dir = self._ensure_device_dir(client_id)
+
+            if 'device' in data:
+                device_file = os.path.join(device_dir, "device_info.json")
+                with open(device_file, 'w', encoding='utf-8') as f:
+                    json.dump(data['device'], f, indent=2, ensure_ascii=False)
+
+            timestamp = data.get('timestamp', int(time.time() * 1000))
+
+            for module in DATA_MODULES:
+                if module in data and data[module] is not None:
+                    module_file = os.path.join(device_dir, f"{module}.json")
+                    with open(module_file, 'w', encoding='utf-8') as f:
+                        json.dump(data[module], f, indent=2, ensure_ascii=False)
+
+                    save_flag, _ = self._get_module_history_settings(client_id, module)
+                    if save_flag:
+                        entry = {
+                            "timestamp": timestamp,
+                            "data": data[module]
+                        }
+                        self._save_history_entry(client_id, module, entry)
+
+            timestamp_file = os.path.join(device_dir, "last_update.json")
+            with open(timestamp_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "last_update": datetime.now().isoformat(),
+                    "timestamp": timestamp
+                }, f, indent=2, ensure_ascii=False)
+
         except Exception as e:
-            logger.error(f"❌ 保存数据失败: {e}")
+            logger.error(f"❌ 保存数据失败 (设备 {client_id}): {e}")
 
     def get_device_stats(self) -> Dict[str, Any]:
-        """构建当前设备状态统计（用于推送）"""
         now = time.time()
         stats = {
             "total_clients": len(self.device_clients),
@@ -354,14 +535,103 @@ class DeviceDataServer:
             except:
                 self.web_clients.discard(ws)
 
+    # ========== HTTP API 历史数据 ==========
+    async def http_history(self, request):
+        device_id = request.query.get('device_id')
+        module = request.query.get('module')
+        if not device_id or not module:
+            return web.json_response({"error": "缺少 device_id 或 module"}, status=400)
 
-# ==================== HTML页面（前端使用 WebSocket） ====================
+        history_file_gz = os.path.join(DATA_DIR, device_id, "hs", f"{module}.history.gz")
+        history_file = os.path.join(DATA_DIR, device_id, "hs", f"{module}.history")
+        if not os.path.exists(history_file_gz) and not os.path.exists(history_file):
+            data = {"deviceId": device_id, "module": module, "timestamps": [], "series": {}}
+            json_str = json.dumps(data, ensure_ascii=False)
+            compressed = gzip.compress(json_str.encode('utf-8'))
+            return web.Response(
+                body=compressed,
+                headers={'Content-Encoding': 'gzip', 'Content-Type': 'application/json'}
+            )
+
+        entries = []
+        target_file = history_file_gz if os.path.exists(history_file_gz) else history_file
+        open_func = gzip.open if target_file.endswith('.gz') else open
+        try:
+            with open_func(target_file, 'rt', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        ts = entry.get('timestamp')
+                        data = entry.get('data')
+                        if ts is not None and data is not None:
+                            entries.append((ts, data))
+                    except:
+                        continue
+        except Exception as e:
+            logger.error(f"读取历史数据失败 {target_file}: {e}")
+            data = {"deviceId": device_id, "module": module, "timestamps": [], "series": {}}
+            json_str = json.dumps(data, ensure_ascii=False)
+            compressed = gzip.compress(json_str.encode('utf-8'))
+            return web.Response(
+                body=compressed,
+                headers={'Content-Encoding': 'gzip', 'Content-Type': 'application/json'}
+            )
+
+        if not entries:
+            data = {"deviceId": device_id, "module": module, "timestamps": [], "series": {}}
+            json_str = json.dumps(data, ensure_ascii=False)
+            compressed = gzip.compress(json_str.encode('utf-8'))
+            return web.Response(
+                body=compressed,
+                headers={'Content-Encoding': 'gzip', 'Content-Type': 'application/json'}
+            )
+
+        all_fields = set()
+        for _, data in entries:
+            for key, value in data.items():
+                if isinstance(value, (int, float, bool)):
+                    all_fields.add(key)
+
+        fields = sorted(list(all_fields))
+        timestamps = [ts for ts, _ in entries]
+        series = {}
+        for field in fields:
+            values = []
+            for _, data in entries:
+                val = data.get(field)
+                if isinstance(val, bool):
+                    val = int(val)
+                if isinstance(val, (int, float)):
+                    values.append(val)
+                else:
+                    values.append(None)
+            series[field] = values
+
+        data = {
+            "deviceId": device_id,
+            "module": module,
+            "timestamps": timestamps,
+            "series": series
+        }
+        json_str = json.dumps(data, ensure_ascii=False)
+        compressed = gzip.compress(json_str.encode('utf-8'))
+        return web.Response(
+            body=compressed,
+            headers={'Content-Encoding': 'gzip', 'Content-Type': 'application/json'}
+        )
+
+
+# ==================== HTML页面（字段级智能单位转换 + 图表容器复用） ====================
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>📱 设备数据监控 (实时)</title>
+    <title>📱 设备数据监控 (智能单位转换)</title>
+    <script src="/static/echarts.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', Arial, sans-serif; background: #0a0e17; color: #e0e0e0; padding: 20px; }
@@ -383,129 +653,112 @@ HTML_PAGE = """
         .header .stats-info .stat-item { text-align: center; }
         .header .stats-info .stat-item .num { font-size: 28px; font-weight: 700; color: #00d4ff; }
         .header .stats-info .stat-item .label { font-size: 12px; color: #8899aa; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        @media (max-width: 1200px) { .grid { grid-template-columns: 1fr; } }
-        .card {
+        .connection-status { font-size: 14px; color: #8899aa; }
+        .connection-status .connected { color: #00ff88; }
+        .connection-status .disconnected { color: #ff4444; }
+
+        .device-row {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+            align-items: stretch;
             background: rgba(20, 30, 50, 0.9);
             border-radius: 16px;
             border: 1px solid rgba(100, 200, 255, 0.08);
-            overflow: hidden;
-            transition: all 0.3s ease;
+            padding: 16px;
+            transition: border-color 0.3s;
         }
-        .card:hover { border-color: rgba(100, 200, 255, 0.2); }
-        .card.offline { opacity: 0.5; }
+        .device-row:hover { border-color: rgba(100, 200, 255, 0.2); }
+        .device-row.offline { opacity: 0.6; }
+
+        .device-card {
+            flex: 0 0 420px;
+            min-width: 320px;
+            display: flex;
+            flex-direction: column;
+        }
         .card-header {
-            padding: 15px 20px;
-            cursor: pointer;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            background: rgba(0, 0, 0, 0.2);
-            user-select: none;
-            transition: background 0.2s;
             flex-wrap: wrap;
             gap: 8px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(100,200,255,0.1);
+            cursor: pointer;
         }
-        .card-header:hover { background: rgba(0, 100, 200, 0.1); }
-        .card-header .device-name {
-            font-size: 16px;
-            font-weight: 600;
-        }
+        .card-header .device-name { font-size: 16px; font-weight: 600; }
         .card-header .device-name .model { color: #00d4ff; }
-        .card-header .device-status {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            font-size: 13px;
-            flex-wrap: wrap;
-        }
-        .card-header .device-status .dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            display: inline-block;
-        }
-        .card-header .device-status .dot.online { background: #00ff88; box-shadow: 0 0 10px #00ff8866; }
-        .card-header .device-status .dot.offline { background: #ff4444; }
-        .card-header .toggle-icon { font-size: 18px; transition: transform 0.3s; display: inline-block; }
-        .card-header .toggle-icon.open { transform: rotate(180deg); }
-        .card-body { display: none; padding: 20px; }
-        .card-body.open { display: block; }
+        .card-header .device-status { display: flex; align-items: center; gap: 12px; font-size: 13px; flex-wrap: wrap; }
+        .card-header .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+        .card-header .dot.online { background: #00ff88; box-shadow: 0 0 10px #00ff8866; }
+        .card-header .dot.offline { background: #ff4444; }
+        .card-body { padding-top: 10px; flex: 1; }
         .data-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 10px;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 8px;
         }
         .data-item {
             background: rgba(0, 0, 0, 0.3);
-            padding: 10px 14px;
-            border-radius: 8px;
+            padding: 8px 12px;
+            border-radius: 6px;
             border-left: 3px solid #00d4ff;
+            cursor: pointer;
+            transition: background 0.2s;
         }
-        .data-item .label { font-size: 11px; color: #8899aa; text-transform: uppercase; letter-spacing: 0.5px; }
-        .data-item .value { font-size: 15px; font-weight: 600; margin-top: 2px; }
+        .data-item:hover { background: rgba(0, 100, 200, 0.15); }
+        .data-item .label { font-size: 10px; color: #8899aa; text-transform: uppercase; letter-spacing: 0.5px; }
+        .data-item .value { font-size: 14px; font-weight: 600; margin-top: 2px; }
         .data-item .value.good { color: #00ff88; }
         .data-item .value.warning { color: #ffaa00; }
         .data-item .value.danger { color: #ff4444; }
         .data-item .sub { font-size: 11px; color: #667788; margin-top: 2px; }
-        .empty-state {
-            text-align: center;
-            padding: 60px 20px;
+        .card-footer {
+            margin-top: 10px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(100,200,255,0.05);
+            font-size: 12px;
             color: #8899aa;
+            display: flex;
+            justify-content: space-between;
+            flex-wrap: wrap;
         }
-        .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
-        .full-width { grid-column: 1 / -1; }
-        .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
-        .placeholder-section {
+        .card-footer .time-value { color: #00d4ff; font-family: monospace; }
+
+        .chart-wrapper {
+            flex: 1;
+            min-height: 350px;
+            min-width: 300px;
             background: rgba(0, 0, 0, 0.2);
             border-radius: 12px;
-            padding: 16px;
-            min-height: 200px;
+            padding: 8px;
+            position: relative;
+        }
+        .chart-wrapper .chart-placeholder {
             display: flex;
             align-items: center;
             justify-content: center;
             color: #667788;
             font-size: 16px;
             text-align: center;
-            border: 1px dashed rgba(100, 200, 255, 0.15);
+            height: 100%;
+            min-height: 280px;
+            border: 1px dashed rgba(100,200,255,0.15);
+            border-radius: 8px;
         }
-        .card-footer {
-            padding: 10px 20px;
-            background: rgba(0, 0, 0, 0.15);
-            border-top: 1px solid rgba(100, 200, 255, 0.05);
-            font-size: 12px;
-            color: #556677;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 8px;
+        .chart-container {
+            width: 100%;
+            height: 100%;
+            min-height: 350px;
         }
-        .card-footer .update-time {
-            color: #8899aa;
+
+        @media (max-width: 900px) {
+            .device-row { flex-wrap: wrap; }
+            .device-card { flex: 1 1 100%; }
+            .chart-wrapper { flex: 1 1 100%; min-height: 250px; }
         }
-        .card-footer .update-time .time-value {
-            color: #00d4ff;
-            font-family: monospace;
-        }
-        .network-status {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            font-size: 12px;
-            padding: 4px 10px;
-            border-radius: 12px;
-            background: rgba(0, 0, 0, 0.3);
-        }
-        .network-status .connected { color: #00ff88; }
-        .network-status .disconnected { color: #ff4444; }
-        .connection-status {
-            font-size: 14px;
-            color: #8899aa;
-        }
-        .connection-status .connected { color: #00ff88; }
-        .connection-status .disconnected { color: #ff4444; }
+        .empty-state { text-align: center; padding: 60px 20px; color: #8899aa; }
     </style>
 </head>
 <body>
@@ -525,57 +778,419 @@ HTML_PAGE = """
         </div>
     </div>
 
-    <div class="grid" id="devicesContainer">
-        <div class="full-width empty-state">
-            <div class="icon">📡</div>
+    <div id="devicesContainer">
+        <div class="empty-state">
+            <div class="icon" style="font-size:48px;">📡</div>
             <p>等待数据...</p>
         </div>
     </div>
 </div>
 
 <script>
-    var cardStates = {};
+    // ==================== 全局状态 ====================
     var ws = null;
     var reconnectTimer = null;
+    var cardStates = {};
+    var chartInstances = {};
 
+    // ==================== 格式化 ====================
     function formatTimestamp(ts) {
         if (!ts || ts <= 0) return '未知';
         try {
             var d = new Date(ts);
             if (isNaN(d.getTime())) return '无效时间';
             return d.toLocaleString('zh-CN', {
-                year: 'numeric',
-                month: '2-digit',
-                day: '2-digit',
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit'
+                year: 'numeric', month: '2-digit', day: '2-digit',
+                hour: '2-digit', minute: '2-digit', second: '2-digit'
             });
-        } catch (e) {
-            return '无效时间';
+        } catch (e) { return '无效时间'; }
+    }
+    function formatTimestampShort(ts) {
+        if (!ts || ts <= 0) return '';
+        try {
+            var d = new Date(ts);
+            return d.toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        } catch (e) { return ''; }
+    }
+
+    // ==================== 智能单位转换（按字段名） ====================
+    function transformField(module, field, values) {
+        // 返回 { data: 转换后的数组, unit: 单位字符串 }
+        var raw = values;
+        if (module === 'battery') {
+            // 电压 mV → V
+            if (field === 'voltage') {
+                return { data: raw.map(v => v !== null ? v / 1000 : null), unit: ' V' };
+            }
+            // 电流 µA → mA (假设原始是µA)
+            if (field === 'current') {
+                return { data: raw.map(v => v !== null ? v / 1000 : null), unit: ' mA' };
+            }
+            // 容量 mAh → Ah
+            if (field === 'capacity') {
+                return { data: raw.map(v => v !== null ? v / 1000 : null), unit: ' Ah' };
+            }
+            // 电量百分比，不缩放
+            if (field === 'level') {
+                return { data: raw, unit: ' %' };
+            }
+            // 温度 0.1°C → °C
+            if (field === 'temperature') {
+                return { data: raw.map(v => v !== null ? v / 10 : null), unit: ' °C' };
+            }
+        }
+        // 网络模块特殊处理（由上层统一单位，此处原样返回）
+        if (module === 'network' && (field === 'downSpeed' || field === 'upSpeed')) {
+            return { data: raw, unit: '' }; // 单位由外层统一处理
+        }
+        // 其他字段：自动数值缩放（KB/MB/GB）
+        return autoScaleByValue(raw);
+    }
+
+    function autoScaleByValue(values) {
+        var maxVal = 0;
+        for (var i=0; i<values.length; i++) {
+            var v = Math.abs(values[i]);
+            if (v > maxVal) maxVal = v;
+        }
+        if (maxVal === 0) return { data: values, unit: '' };
+        var scale = 1;
+        var unit = '';
+        if (maxVal > 1024*1024*1024) { scale = 1/(1024*1024*1024); unit = ' GB'; }
+        else if (maxVal > 1024*1024) { scale = 1/(1024*1024); unit = ' MB'; }
+        else if (maxVal > 1024) { scale = 1/1024; unit = ' KB'; }
+        if (maxVal > 1024) {
+            var scaled = values.map(function(v) { return v !== null ? v * scale : null; });
+            return { data: scaled, unit: unit };
+        } else {
+            return { data: values, unit: '' };
         }
     }
 
-    function renderDevices(data) {
-        var container = document.getElementById('devicesContainer');
-        if (!container) return;
+    // 网络流量统一单位：确保 downSpeed 和 upSpeed 使用相同单位 (KB/s 或 MB/s)
+    function transformNetworkFields(fields, seriesData) {
+        // fields 是包含 downSpeed, upSpeed 等的数组
+        var downRaw = seriesData['downSpeed'] || [];
+        var upRaw = seriesData['upSpeed'] || [];
+        // 计算最大值，决定单位
+        var maxVal = 0;
+        var allVals = downRaw.concat(upRaw);
+        for (var i=0; i<allVals.length; i++) {
+            var v = Math.abs(allVals[i]);
+            if (v > maxVal) maxVal = v;
+        }
+        var scale = 1;
+        var unit = ' B/s';
+        if (maxVal > 1024*1024) { scale = 1/(1024*1024); unit = ' MB/s'; }
+        else if (maxVal > 1024) { scale = 1/1024; unit = ' KB/s'; }
+        // 如果最大值小于1024，保持 B/s
+        var transformed = {};
+        fields.forEach(function(field) {
+            var raw = seriesData[field] || [];
+            if (field === 'downSpeed' || field === 'upSpeed') {
+                var scaled = raw.map(function(v) { return v !== null ? v * scale : null; });
+                transformed[field] = { data: scaled, unit: unit };
+            } else {
+                // 其他字段（如 signalLevel 等）单独处理
+                var result = autoScaleByValue(raw);
+                transformed[field] = { data: result.data, unit: result.unit };
+            }
+        });
+        return transformed;
+    }
 
-        var deviceKeys = Object.keys(data.devices || {});
-        document.getElementById('totalClients').textContent = data.total_clients || 0;
+    // ==================== 图表操作 ====================
+    function initChart(deviceId) {
+        var containerId = 'chart-' + deviceId.replace(/[^a-zA-Z0-9]/g, '_');
+        var container = document.getElementById(containerId);
+        if (!container) return null;
+        var chart = echarts.init(container, 'dark');
+        chartInstances[deviceId] = { chart: chart, currentModule: null, seriesData: { timestamps: [], fields: {} } };
+        window.addEventListener('resize', function() { chart.resize(); });
+        return chart;
+    }
 
-        if (deviceKeys.length === 0) {
-            container.innerHTML = `
-                <div class="full-width empty-state">
-                    <div class="icon">📡</div>
-                    <p>暂无设备连接</p>
-                </div>
-            `;
+    function renderChart(deviceId, module, data) {
+        var inst = chartInstances[deviceId];
+        if (!inst) {
+            var chart = initChart(deviceId);
+            if (!chart) return;
+            inst = chartInstances[deviceId];
+        }
+        var chart = inst.chart;
+        inst.currentModule = module;
+        inst.seriesData = {
+            timestamps: data.timestamps || [],
+            fields: data.series || {}
+        };
+
+        var timestamps = inst.seriesData.timestamps;
+        var fields = Object.keys(inst.seriesData.fields);
+        if (!timestamps.length || !fields.length) {
+            chart.clear();
+            chart.setOption({
+                title: { text: '暂无历史数据', left: 'center', top: 'center', textStyle: { color: '#667788', fontSize: 16, fontWeight: 'normal' } }
+            });
+            chart.resize();
             return;
         }
 
+        // ---- 智能转换 ----
+        var transformedData = {};
+        var seriesOptions = [];
+
+        if (module === 'network') {
+            // 网络模块特殊处理：统一 downSpeed/upSpeed 单位
+            var netTransformed = transformNetworkFields(fields, inst.seriesData.fields);
+            fields.forEach(function(field) {
+                var item = netTransformed[field];
+                if (item) {
+                    transformedData[field] = item;
+                } else {
+                    // fallback
+                    var raw = inst.seriesData.fields[field];
+                    var result = autoScaleByValue(raw);
+                    transformedData[field] = result;
+                }
+            });
+            // 构建 series
+            fields.forEach(function(field) {
+                var item = transformedData[field];
+                seriesOptions.push({
+                    name: field + item.unit,
+                    type: 'line',
+                    data: item.data,
+                    smooth: true,
+                    symbol: 'circle',
+                    symbolSize: 3,
+                    connectNulls: true
+                });
+            });
+        } else {
+            // 其他模块：逐字段转换
+            fields.forEach(function(field) {
+                var raw = inst.seriesData.fields[field];
+                var result = transformField(module, field, raw);
+                transformedData[field] = result;
+                seriesOptions.push({
+                    name: field + result.unit,
+                    type: 'line',
+                    data: result.data,
+                    smooth: true,
+                    symbol: 'circle',
+                    symbolSize: 3,
+                    connectNulls: true
+                });
+            });
+        }
+
+        // 图例数据（带单位）
+        var legendData = fields.map(function(field) {
+            return field + (transformedData[field] ? transformedData[field].unit : '');
+        });
+
+        var timeLabels = timestamps.map(function(ts) { return formatTimestampShort(ts); });
+
+        var option = {
+            tooltip: {
+                trigger: 'axis',
+                formatter: function(params) {
+                    var ts = timestamps[params[0].dataIndex];
+                    var html = formatTimestamp(ts) + '<br/>';
+                    params.forEach(function(p) {
+                        html += p.marker + ' ' + p.seriesName + ': ' + p.value + '<br/>';
+                    });
+                    return html;
+                }
+            },
+            legend: {
+                data: legendData,
+                textStyle: { color: '#8899aa' },
+                type: 'scroll',
+                top: 0,
+                left: 'center'
+            },
+            grid: { left: '5%', right: '5%', bottom: '25%', top: '15%', containLabel: true },
+            xAxis: {
+                type: 'category',
+                data: timeLabels,
+                axisLabel: { rotate: 30, interval: Math.max(1, Math.floor(timeLabels.length / 20)), color: '#8899aa', fontSize: 10 },
+                axisLine: { lineStyle: { color: '#334455' } }
+            },
+            yAxis: {
+                type: 'value',
+                axisLabel: { color: '#8899aa' },
+                splitLine: { lineStyle: { color: '#1a2a3a', type: 'dashed' } }
+            },
+            series: seriesOptions,
+            dataZoom: [{
+                type: 'slider',
+                start: 0,
+                end: 100,
+                height: 20,
+                bottom: 5,
+                borderColor: '#1a2a3a',
+                fillerColor: 'rgba(0, 212, 255, 0.1)',
+                handleStyle: { color: '#00d4ff' },
+                textStyle: { color: '#8899aa' }
+            }]
+        };
+        chart.setOption(option, true);
+        chart.resize();
+    }
+
+    function updateChartNewPoint(deviceId, module, timestamp, newData) {
+        var inst = chartInstances[deviceId];
+        if (!inst) return;
+        if (inst.currentModule !== module) return;
+
+        var seriesData = inst.seriesData;
+        var fields = Object.keys(seriesData.fields);
+        if (fields.length === 0) return;
+
+        var lastTs = seriesData.timestamps[seriesData.timestamps.length - 1];
+        if (lastTs === timestamp) return;
+
+        seriesData.timestamps.push(timestamp);
+        fields.forEach(function(field) {
+            var val = newData[field];
+            if (typeof val === 'boolean') val = val ? 1 : 0;
+            if (typeof val === 'number') {
+                seriesData.fields[field].push(val);
+            } else {
+                seriesData.fields[field].push(null);
+            }
+        });
+
+        // 重新转换并更新
+        var timestamps = seriesData.timestamps;
+        var fields2 = Object.keys(seriesData.fields);
+        var transformedData = {};
+        var seriesOptions = [];
+
+        if (module === 'network') {
+            var netTransformed = transformNetworkFields(fields2, seriesData.fields);
+            fields2.forEach(function(field) {
+                var item = netTransformed[field];
+                if (item) {
+                    transformedData[field] = item;
+                } else {
+                    var raw = seriesData.fields[field];
+                    var result = autoScaleByValue(raw);
+                    transformedData[field] = result;
+                }
+            });
+            fields2.forEach(function(field) {
+                var item = transformedData[field];
+                seriesOptions.push({
+                    name: field + item.unit,
+                    type: 'line',
+                    data: item.data,
+                    smooth: true,
+                    symbol: 'circle',
+                    symbolSize: 3,
+                    connectNulls: true
+                });
+            });
+        } else {
+            fields2.forEach(function(field) {
+                var raw = seriesData.fields[field];
+                var result = transformField(module, field, raw);
+                transformedData[field] = result;
+                seriesOptions.push({
+                    name: field + result.unit,
+                    type: 'line',
+                    data: result.data,
+                    smooth: true,
+                    symbol: 'circle',
+                    symbolSize: 3,
+                    connectNulls: true
+                });
+            });
+        }
+
+        var legendData = fields2.map(function(field) {
+            return field + (transformedData[field] ? transformedData[field].unit : '');
+        });
+        var timeLabels = timestamps.map(function(ts) { return formatTimestampShort(ts); });
+
+        inst.chart.setOption({
+            xAxis: { data: timeLabels },
+            series: seriesOptions,
+            legend: { data: legendData }
+        }, false);
+        inst.chart.resize();
+    }
+
+    function loadHistory(deviceId, module) {
+        var inst = chartInstances[deviceId];
+        if (!inst) {
+            initChart(deviceId);
+            inst = chartInstances[deviceId];
+            if (!inst) return;
+        }
+        var chart = inst.chart;
+        chart.clear();
+        chart.setOption({
+            title: { text: '加载中...', left: 'center', top: 'center', textStyle: { color: '#667788', fontSize: 16 } }
+        });
+        chart.resize();
+
+        fetch('/api/history?device_id=' + encodeURIComponent(deviceId) + '&module=' + encodeURIComponent(module))
+            .then(res => res.json())
+            .then(data => {
+                if (data.series) {
+                    renderChart(deviceId, module, data);
+                } else {
+                    renderChart(deviceId, module, { timestamps: [], series: {} });
+                }
+            })
+            .catch(err => {
+                console.error('加载历史失败:', err);
+                renderChart(deviceId, module, { timestamps: [], series: {} });
+            });
+    }
+
+    function onDataItemClick(deviceId, module) {
+        loadHistory(deviceId, module);
+    }
+
+    // ==================== 渲染设备（复用图表容器） ====================
+    function renderDevices(stats) {
+        var container = document.getElementById('devicesContainer');
+        if (!container) return;
+
+        var deviceKeys = Object.keys(stats.devices || {});
+        document.getElementById('totalClients').textContent = stats.total_clients || 0;
+
+        if (deviceKeys.length === 0) {
+            container.innerHTML = '<div class="empty-state"><div style="font-size:48px;">📡</div><p>暂无设备连接</p></div>';
+            for (var id in chartInstances) {
+                if (chartInstances[id].chart) chartInstances[id].chart.dispose();
+            }
+            chartInstances = {};
+            return;
+        }
+
+        // 保存旧图表容器
+        var savedCharts = {};
+        var existingRows = container.querySelectorAll('.device-row');
+        existingRows.forEach(function(row) {
+            var cid = row.getAttribute('data-client-id');
+            if (!cid) return;
+            var chartContainer = row.querySelector('.chart-container');
+            if (chartContainer) {
+                chartContainer.remove();
+                savedCharts[cid] = chartContainer;
+            }
+        });
+
+        container.innerHTML = '';
+
         var html = '';
-        for (var clientId in data.devices) {
-            var dev = data.devices[clientId];
+        for (var i = 0; i < deviceKeys.length; i++) {
+            var clientId = deviceKeys[i];
+            var dev = stats.devices[clientId];
             var isOnline = dev.last_seen !== null;
 
             var battery = dev.battery || {};
@@ -583,7 +1198,8 @@ HTML_PAGE = """
             var batteryClass = batteryLevel >= 50 ? 'good' : (batteryLevel >= 20 ? 'warning' : 'danger');
 
             var foreground = dev.foreground || {};
-            var fgName = foreground.packageName || 'Unknown';
+            var fgTitle = foreground.windowTitle || foreground.packageName || 'Unknown';
+            var fgApp = foreground.packageName || 'Unknown';
 
             var memory = dev.memory || {};
             var memoryTotal = memory.total || 0;
@@ -632,10 +1248,10 @@ HTML_PAGE = """
 
             var safeId = clientId.replace(/[^a-zA-Z0-9]/g, '_');
             var bodyId = 'body-' + safeId;
-            var cardId = 'device-' + safeId;
+            var chartId = 'chart-' + safeId;
 
             var isOpen = cardStates[clientId] || false;
-            var toggleClass = isOpen ? 'open' : '';
+            var toggleIcon = isOpen ? '▲' : '▼';
 
             var netIcon = netConnected ? '✅' : '❌';
             var netStatusClass = netConnected ? 'connected' : 'disconnected';
@@ -643,123 +1259,163 @@ HTML_PAGE = """
             if (netTypeDetail) netTypeDisplay += ' (' + netTypeDetail + ')';
             if (netSignalLevel) netTypeDisplay += ' 信号: ' + netSignalLevel;
 
+            var dataItems = [
+                { label: '🔋 电池', value: batteryLevel + '%', sub: battery.charging ? '⚡ 充电中' : '🔌 未充电', cls: batteryClass, module: 'battery' },
+                { label: '💾 内存', value: memoryUsedMB + ' / ' + memoryMB + ' MB', sub: '使用 ' + memoryPercent + '%', module: 'memory' },
+                { label: '💾 存储', value: storageUsedGB + ' / ' + storageGB + ' GB', sub: '使用 ' + storagePercent + '%', module: 'storage' },
+                { label: '📱 前台', value: fgTitle, sub: fgApp, module: 'foreground' },
+                { label: '🖥️ 屏幕', value: screenStatus, sub: '亮度: ' + brightness, module: 'screen' },
+                { label: '📍 位置', value: locationStr, sub: hasLocation ? '✅ GPS' : '❌ 无定位', module: 'location' },
+                { label: '📡 传感器', value: sensorCount + ' 个', module: 'sensors' }
+            ];
+            var dataItemsHtml = '';
+            for (var j = 0; j < dataItems.length; j++) {
+                var item = dataItems[j];
+                var clickAttr = item.module ? ` onclick="onDataItemClick('${clientId}', '${item.module}')"` : '';
+                dataItemsHtml += `
+                    <div class="data-item"${clickAttr}>
+                        <div class="label">${item.label}</div>
+                        <div class="value ${item.cls || ''}">${item.value}</div>
+                        <div class="sub">${item.sub}</div>
+                    </div>
+                `;
+            }
+
+            var netItemsHtml = `
+                <div class="data-item" style="border-left-color:#00d4ff;">
+                    <div class="label">🌐 网络</div>
+                    <div class="value" style="font-size:14px;">${netTypeDisplay}</div>
+                    <div class="sub">${netDetail ? '| ' + netDetail : ''}</div>
+                </div>
+                <div class="data-item" style="border-left-color:#00d4ff;" onclick="onDataItemClick('${clientId}', 'network')">
+                    <div class="label">⬇️ 下载</div>
+                    <div class="value good">${netDownSpeed}</div>
+                    <div class="sub">间隔: ${netIntervalRx}</div>
+                </div>
+                <div class="data-item" style="border-left-color:#ffaa00;" onclick="onDataItemClick('${clientId}', 'network')">
+                    <div class="label">⬆️ 上传</div>
+                    <div class="value warning">${netUpSpeed}</div>
+                    <div class="sub">间隔: ${netIntervalTx}</div>
+                </div>
+                <div class="data-item" style="border-left-color:#667788;" onclick="onDataItemClick('${clientId}', 'network')">
+                    <div class="label">📊 总流量</div>
+                    <div class="value" style="font-size:13px;">⬇️ ${netTotalRx} / ⬆️ ${netTotalTx}</div>
+                </div>
+            `;
+
+            var rowClass = isOnline ? '' : 'offline';
             html += `
-            <div class="card ${isOnline ? '' : 'offline'}" id="${cardId}">
-                <div class="card-header" onclick="toggleCard('${bodyId}', '${clientId}')">
-                    <div class="device-name">
-                        <span class="model">${deviceModel}</span>
-                        <span style="font-size:13px;color:#8899aa;margin-left:8px;">${deviceManufacturer}</span>
-                        <span style="font-size:12px;color:#556677;margin-left:8px;">${screenWidth}×${screenHeight}</span>
-                    </div>
-                    <div class="device-status">
-                        <span>🔋 ${batteryLevel}%</span>
-                        <span>📱 ${fgName.length > 15 ? fgName.substring(0, 15)+'...' : fgName}</span>
-                        <span class="network-status">
-                            <span class="${netStatusClass}">${netIcon}</span>
-                            ${netType}
-                        </span>
-                        <span>
-                            <span class="dot ${isOnline ? 'online' : 'offline'}"></span>
-                            ${isOnline ? '在线' : '离线'}
-                        </span>
-                        <span class="toggle-icon ${toggleClass}" id="toggle-${bodyId}">▼</span>
-                    </div>
-                </div>
-                <div class="card-body ${toggleClass}" id="${bodyId}">
-                    <div class="two-col">
-                        <div>
-                            <div class="data-grid">
-                                <div class="data-item">
-                                    <div class="label">🔋 电池</div>
-                                    <div class="value ${batteryClass}">${batteryLevel}%</div>
-                                    <div class="sub">${battery.charging ? '⚡ 充电中' : '🔌 未充电'}</div>
-                                </div>
-                                <div class="data-item">
-                                    <div class="label">💾 内存</div>
-                                    <div class="value">${memoryUsedMB} / ${memoryMB} MB</div>
-                                    <div class="sub">使用 ${memoryPercent}%</div>
-                                </div>
-                                <div class="data-item">
-                                    <div class="label">💾 存储</div>
-                                    <div class="value">${storageUsedGB} / ${storageGB} GB</div>
-                                    <div class="sub">使用 ${storagePercent}%</div>
-                                </div>
-                                <div class="data-item">
-                                    <div class="label">📱 前台应用</div>
-                                    <div class="value" style="font-size:13px;">${fgName}</div>
-                                </div>
-                                <div class="data-item">
-                                    <div class="label">🖥️ 屏幕</div>
-                                    <div class="value">${screenStatus}</div>
-                                    <div class="sub">亮度: ${brightness}</div>
-                                </div>
-                                <div class="data-item">
-                                    <div class="label">📍 位置</div>
-                                    <div class="value" style="font-size:13px;">${locationStr}</div>
-                                    <div class="sub">${hasLocation ? '✅ GPS定位' : '❌ 无定位'}</div>
-                                </div>
-                                <div class="data-item">
-                                    <div class="label">📡 传感器数据</div>
-                                    <div class="value">${sensorCount} 个</div>
-                                    <div class="sub">传感器总数</div>
-                                </div>
-                            </div>
-                            <div class="data-grid" style="margin-top:10px;">
-                                <div class="data-item" style="border-left-color:#00d4ff;">
-                                    <div class="label">🌐 网络</div>
-                                    <div class="value" style="font-size:14px;">${netTypeDisplay}</div>
-                                    <div class="sub">${netDetail ? '| ' + netDetail : ''}</div>
-                                </div>
-                                <div class="data-item" style="border-left-color:#00d4ff;">
-                                    <div class="label">⬇️ 下载速度</div>
-                                    <div class="value good">${netDownSpeed}</div>
-                                    <div class="sub">间隔流量: ${netIntervalRx}</div>
-                                </div>
-                                <div class="data-item" style="border-left-color:#ffaa00;">
-                                    <div class="label">⬆️ 上传速度</div>
-                                    <div class="value warning">${netUpSpeed}</div>
-                                    <div class="sub">间隔流量: ${netIntervalTx}</div>
-                                </div>
-                                <div class="data-item" style="border-left-color:#667788;">
-                                    <div class="label">📊 总流量</div>
-                                    <div class="value" style="font-size:13px;">⬇️ ${netTotalRx} / ⬆️ ${netTotalTx}</div>
-                                </div>
-                            </div>
+            <div class="device-row ${rowClass}" data-client-id="${clientId}" id="row-${safeId}">
+                <div class="device-card">
+                    <div class="card-header" onclick="toggleCard('${bodyId}', '${clientId}')">
+                        <div class="device-name">
+                            <span class="model">${deviceModel}</span>
+                            <span style="font-size:13px;color:#8899aa;margin-left:8px;">${deviceManufacturer}</span>
+                            <span style="font-size:12px;color:#556677;margin-left:8px;">${screenWidth}×${screenHeight}</span>
                         </div>
-                        <div>
-                            <div class="placeholder-section">
-                                📊 点击右侧数据查看详细历史记录
-                            </div>
+                        <div class="device-status">
+                            <span>🔋 ${batteryLevel}%</span>
+                            <span>📱 ${fgTitle.length > 15 ? fgTitle.substring(0,15)+'...' : fgTitle}</span>
+                            <span class="network-status">
+                                <span class="${netStatusClass}">${netIcon}</span>
+                                ${netType}
+                            </span>
+                            <span><span class="dot ${isOnline ? 'online' : 'offline'}"></span>${isOnline ? '在线' : '离线'}</span>
+                            <span style="font-size:18px;transition:transform 0.3s;">${toggleIcon}</span>
+                        </div>
+                    </div>
+                    <div class="card-body" id="${bodyId}" style="display:${isOpen ? 'block' : 'none'};">
+                        <div class="data-grid">
+                            ${dataItemsHtml}
+                        </div>
+                        <div class="data-grid" style="margin-top:10px;">
+                            ${netItemsHtml}
+                        </div>
+                        <div class="card-footer">
+                            <span>🕐 更新: <span class="time-value">${updateTimeStr}</span></span>
+                            <span>📊 权限: ${dev.permission_level || 'unknown'}</span>
                         </div>
                     </div>
                 </div>
-                <div class="card-footer">
-                    <span class="update-time">🕐 数据更新: <span class="time-value">${updateTimeStr}</span></span>
-                    <span>📊 权限等级: ${dev.permission_level || 'unknown'}</span>
+                <div class="chart-wrapper">
+                    <div id="${chartId}" class="chart-container"></div>
                 </div>
             </div>
             `;
         }
         container.innerHTML = html;
-    }
 
-    function toggleCard(bodyId, clientId) {
-        var body = document.getElementById(bodyId);
-        var toggle = document.getElementById('toggle-' + bodyId);
-        if (body) {
-            var isOpen = body.classList.contains('open');
-            if (isOpen) {
-                body.classList.remove('open');
-                if (toggle) toggle.classList.remove('open');
-                cardStates[clientId] = false;
+        // 恢复保存的图表容器
+        var newRows = container.querySelectorAll('.device-row');
+        newRows.forEach(function(row) {
+            var cid = row.getAttribute('data-client-id');
+            if (!cid) return;
+            var saved = savedCharts[cid];
+            if (saved) {
+                var wrapper = row.querySelector('.chart-wrapper');
+                if (wrapper) {
+                    wrapper.innerHTML = '';
+                    wrapper.appendChild(saved);
+                    var inst = chartInstances[cid];
+                    if (inst && inst.chart) {
+                        inst.chart.resize();
+                    }
+                }
             } else {
-                body.classList.add('open');
-                if (toggle) toggle.classList.add('open');
-                cardStates[clientId] = true;
+                var placeholder = row.querySelector('.chart-container');
+                if (placeholder) {
+                    placeholder.innerHTML = '<div class="chart-placeholder">📊 点击左侧数据项查看趋势</div>';
+                }
+            }
+        });
+
+        // 清理不存在的图表实例
+        var currentIds = {};
+        newRows.forEach(function(row) {
+            var cid = row.getAttribute('data-client-id');
+            if (cid) currentIds[cid] = true;
+        });
+        for (var id in chartInstances) {
+            if (!currentIds[id]) {
+                if (chartInstances[id].chart) chartInstances[id].chart.dispose();
+                delete chartInstances[id];
+            }
+        }
+
+        // 恢复已有图表的 option（但需要重新应用转换？如果之前已加载数据，则重新渲染可保持状态）
+        // 由于我们只移动容器，图表实例中的 seriesData 还在，但可能需要重新应用转换（因为转换规则可能不变）
+        // 但为了保留缩放状态，我们只 resize，option 不变
+        for (var id in chartInstances) {
+            var inst = chartInstances[id];
+            if (inst.currentModule && inst.seriesData.timestamps.length > 0) {
+                // 确保容器存在
+                var containerId = 'chart-' + id.replace(/[^a-zA-Z0-9]/g, '_');
+                var el = document.getElementById(containerId);
+                if (el && inst.chart) {
+                    inst.chart.resize();
+                }
             }
         }
     }
 
+    function toggleCard(bodyId, clientId) {
+        var body = document.getElementById(bodyId);
+        if (!body) return;
+        var isOpen = body.style.display !== 'none';
+        body.style.display = isOpen ? 'none' : 'block';
+        cardStates[clientId] = !isOpen;
+        var row = document.getElementById('row-' + clientId.replace(/[^a-zA-Z0-9]/g, '_'));
+        if (row) {
+            var icon = row.querySelector('.card-header span:last-child');
+            if (icon) icon.textContent = isOpen ? '▼' : '▲';
+        }
+        setTimeout(function() {
+            var inst = chartInstances[clientId];
+            if (inst && inst.chart) inst.chart.resize();
+        }, 100);
+    }
+
+    // ==================== WebSocket ====================
     function connectWebSocket() {
         var protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         var wsUrl = protocol + '//' + window.location.hostname + ':' + {{WS_PORT}};
@@ -769,30 +1425,27 @@ HTML_PAGE = """
             document.getElementById('connStatus').innerHTML = '🟢 已连接 (实时)';
             document.getElementById('connStatus').className = 'connection-status connected';
             ws.send(JSON.stringify({type: 'web'}));
-            if (reconnectTimer) {
-                clearInterval(reconnectTimer);
-                reconnectTimer = null;
-            }
+            if (reconnectTimer) { clearInterval(reconnectTimer); reconnectTimer = null; }
         };
 
         ws.onmessage = function(event) {
             try {
-                var data = JSON.parse(event.data);
-                renderDevices(data);
-                // 恢复展开状态
-                for (var id in cardStates) {
-                    if (cardStates[id]) {
-                        var bodyId = 'body-' + id.replace(/[^a-zA-Z0-9]/g, '_');
-                        var body = document.getElementById(bodyId);
-                        var toggle = document.getElementById('toggle-' + bodyId);
-                        if (body) {
-                            body.classList.add('open');
-                            if (toggle) toggle.classList.add('open');
-                        }
+                var msg = JSON.parse(event.data);
+                if (msg.type !== 'history_response') {
+                    renderDevices(msg);
+                    for (var clientId in msg.devices) {
+                        var inst = chartInstances[clientId];
+                        if (!inst || !inst.currentModule) continue;
+                        var devData = msg.devices[clientId];
+                        if (!devData) continue;
+                        var moduleData = devData[inst.currentModule];
+                        if (!moduleData) continue;
+                        var timestamp = devData.data_timestamp || Date.now();
+                        updateChartNewPoint(clientId, inst.currentModule, timestamp, moduleData);
                     }
                 }
             } catch (e) {
-                console.error('解析数据失败:', e);
+                console.error('解析消息失败:', e);
             }
         };
 
@@ -808,13 +1461,11 @@ HTML_PAGE = """
             }
         };
 
-        ws.onerror = function(err) {
-            console.error('WebSocket错误:', err);
-        };
+        ws.onerror = function(err) { console.error('WebSocket错误:', err); };
     }
 
     connectWebSocket();
-    console.log('📱 DeviceMonitor (实时推送) 已启动');
+    console.log('📱 DeviceMonitor (智能单位转换, 图表容器复用) 已启动');
 </script>
 </body>
 </html>
@@ -827,7 +1478,6 @@ def get_html():
 
 
 async def web_handler(request):
-    from aiohttp import web
     return web.Response(body=get_html().encode('utf-8'), content_type='text/html')
 
 
@@ -879,22 +1529,26 @@ async def stdin_reader(server: DeviceDataServer):
         except Exception as e:
             logger.error(f"终端命令处理错误: {e}")
 
+
 async def handle_reload(server: DeviceDataServer):
-    global CONFIG
+    global CONFIG, DATA_MODULES
     logger.info("🔄 正在重新加载配置并重启服务器...")
-    await server.stop()  # 等待停止完成
+    await server.stop()
     try:
         new_config = load_config()
         CONFIG = new_config
         log_level = CONFIG.get('log_level', 0)
         set_log_level(log_level)
+        DATA_MODULES = CONFIG.get('data_modules', DEFAULT_CONFIG['data_modules'])
         logger.info("✅ 配置文件已重新加载")
+        logger.info(f"📦 数据模块: {', '.join(DATA_MODULES)}")
     except Exception as e:
         logger.error(f"❌ 重载配置失败: {e}")
-    # 设置重启标志
     asyncio.get_event_loop().call_soon(setattr, sys.modules[__name__], 'need_restart', True)
 
+
 need_restart = False
+
 
 async def handle_log_level(level: int):
     global CONFIG
@@ -911,52 +1565,45 @@ async def handle_log_level(level: int):
 # ==================== 主程序 ====================
 async def main():
     global need_restart
-    from aiohttp import web
-
     server = DeviceDataServer()
-    ws_port = CONFIG.get("ws_port", 32767)
-    web_port = CONFIG.get("web_port", 8080)
+    ws_port = CONFIG.get("ws_port", 91)
+    web_port = CONFIG.get("web_port", 80)
     host = CONFIG.get("host", "0.0.0.0")
 
     logger.info("=" * 80)
-    logger.info("📱 设备数据接收服务器 v9.5 (完整稳定版)")
+    logger.info("📱 设备数据接收服务器 v15.3 (智能单位转换)")
     logger.info("=" * 80)
     logger.info(f"🌐 WebSocket: ws://{host}:{ws_port}")
     logger.info(f"🌐 Web界面: http://{host}:{web_port}")
-    logger.info(f"📁 数据目录: {DATA_DIR}")
-    logger.info("📝 配置文件: server_config.json")
+    logger.info(f"📁 数据存储目录: {DATA_DIR}")
+    logger.info("📁 存储结构: device_data/<deviceId>/<module>.json + hs/<module>.history.gz")
+    logger.info("📝 全局配置: server_config.json")
+    logger.info("📝 设备配置: device_data/<deviceId>/historySet.ini")
+    logger.info(f"📦 数据模块: {', '.join(DATA_MODULES)}")
+    logger.info("📄 静态资源: /static/echarts.min.js")
     logger.info("💡 在终端输入 .help 查看命令")
     logger.info("=" * 80)
 
-    # 启动 Web 服务
-    try:
-        async def stats_handler(request):
-            return web.json_response(server.get_device_stats())
+    app = web.Application()
+    app.router.add_get('/', web_handler)
+    app.router.add_get('/api/stats', server.http_history)
+    app.router.add_get('/api/devices', lambda r: web.json_response(server.device_data))
+    app.router.add_get('/api/history', server.http_history)
+    app.router.add_static('/static', 'static')
 
-        async def devices_handler(request):
-            return web.json_response(server.device_data)
-
-        app = web.Application()
-        app.router.add_get('/', web_handler)
-        app.router.add_get('/api/stats', stats_handler)
-        app.router.add_get('/api/devices', devices_handler)
-
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, host, web_port)
-        await site.start()
-        logger.info(f"✅ Web界面: http://localhost:{web_port}")
-    except Exception as e:
-        logger.warning(f"⚠️ Web界面启动失败: {e}")
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, web_port)
+    await site.start()
+    logger.info(f"✅ Web界面: http://localhost:{web_port}")
 
     stdin_task = asyncio.create_task(stdin_reader(server))
 
     ws_task = None
-    need_restart = True  # 首次启动
+    need_restart = True
 
     while True:
         if need_restart:
-            # 如果已有任务，先确保它完全停止
             if ws_task is not None:
                 if not ws_task.done():
                     ws_task.cancel()
@@ -967,10 +1614,8 @@ async def main():
                     except:
                         pass
                 ws_task = None
-            # 强制停止服务器（防止残留）
             await server.stop()
             need_restart = False
-            # 启动新服务器
             try:
                 ws_task = asyncio.create_task(server.start())
                 logger.info("WebSocket 服务器启动任务已创建")
@@ -980,7 +1625,6 @@ async def main():
                 need_restart = True
                 continue
 
-        # 检查任务状态
         if ws_task is not None and ws_task.done():
             try:
                 await ws_task
