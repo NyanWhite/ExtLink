@@ -1,18 +1,19 @@
 ﻿# ws_server.py
-# 修复版 - 去掉3D显示，传感器数据全量展示 + 网络监控显示
+# 实时推送版 + 终端命令 + 配置文件心跳参数
 
 import asyncio
 import json
 import logging
 import time
 import os
+import sys
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Set
 import websockets
 
-# 配置日志
+# 配置日志（后续会根据配置文件调整级别）
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
@@ -20,32 +21,48 @@ logger = logging.getLogger(__name__)
 
 # ==================== 配置文件 ====================
 CONFIG_FILE = "server_config.json"
-
 DEFAULT_CONFIG = {
     "ws_port": 32767,
     "web_port": 8080,
     "host": "0.0.0.0",
     "data_dir": "device_data",
-    "enable_3d_view": True
+    "log_level": 0,          # 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR
+    "ping_interval": 30,     # WebSocket 心跳间隔（秒）
+    "ping_timeout": 60       # WebSocket 心跳超时（秒）
 }
 
 def load_config():
+    """强制加载外部配置文件，若文件不存在或格式错误则抛出异常"""
+    if not os.path.exists(CONFIG_FILE):
+        raise FileNotFoundError(f"配置文件 {CONFIG_FILE} 不存在，请创建并配置。")
     try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                for key in DEFAULT_CONFIG:
-                    if key not in config:
-                        config[key] = DEFAULT_CONFIG[key]
-                return config
-    except Exception as e:
-        logger.warning(f"加载配置文件失败: {e}")
-    
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
-    return DEFAULT_CONFIG
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"配置文件 {CONFIG_FILE} 格式错误: {e}")
+    # 补全缺失的键
+    for key in DEFAULT_CONFIG:
+        if key not in config:
+            logger.warning(f"配置项 '{key}' 缺失，使用默认值: {DEFAULT_CONFIG[key]}")
+            config[key] = DEFAULT_CONFIG[key]
+    return config
 
-CONFIG = load_config()
+def set_log_level(level_code: int):
+    """根据等级代码设置日志级别"""
+    level_map = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING, 3: logging.ERROR}
+    level = level_map.get(level_code, logging.DEBUG)
+    logging.getLogger().setLevel(level)
+    logger.info(f"日志级别设置为: {logging.getLevelName(level)} (代码 {level_code})")
+
+# 加载配置，若失败则退出
+try:
+    CONFIG = load_config()
+except (FileNotFoundError, ValueError) as e:
+    logger.error(f"配置加载失败: {e}")
+    sys.exit(1)
+
+# 设置日志级别
+set_log_level(CONFIG.get("log_level", 0))
 
 DATA_DIR = CONFIG.get("data_dir", "device_data")
 try:
@@ -58,74 +75,157 @@ except Exception as e:
 
 class DeviceDataServer:
     def __init__(self):
-        self.clients: Dict[str, websockets.WebSocketServerProtocol] = {}
+        self.device_clients: Dict[str, websockets.WebSocketServerProtocol] = {}
+        self.web_clients: Set[websockets.WebSocketServerProtocol] = set()
         self.device_data: Dict[str, Dict] = {}
         self.device_last_seen: Dict[str, float] = {}
         self.device_info: Dict[str, Dict] = {}
         self.total_messages = 0
+
         self.running = False
-        
+        self.websocket_server = None
+        self.stop_event = asyncio.Event()
+
     async def start(self):
+        """启动 WebSocket 服务器，阻塞直到收到停止信号"""
+        if self.running:
+            logger.warning("服务器已经在运行，忽略")
+            return
+
+        # 重置停止事件，避免上次的信号影响
+        self.stop_event.clear()
         self.running = True
+
         ws_port = CONFIG.get("ws_port", 32767)
         host = CONFIG.get("host", "0.0.0.0")
-        logger.info(f"🌐 WebSocket服务器启动在 {host}:{ws_port}")
-
-        async with websockets.serve(
-            self.handle_client,
-            host,
-            ws_port,
-            ping_interval=30,
-            ping_timeout=60,
-            max_size=10 * 1024 * 1024
-        ):
-            await asyncio.Future()
-
-    async def handle_client(self, websocket: websockets.WebSocketServerProtocol):
-        client_id = None
+        ping_interval = CONFIG.get("ping_interval", 30)
+        ping_timeout = CONFIG.get("ping_timeout", 60)
 
         try:
-            message = await websocket.recv()
+            self.websocket_server = await websockets.serve(
+                self.handle_client,
+                host,
+                ws_port,
+                ping_interval=ping_interval,
+                ping_timeout=ping_timeout,
+                max_size=10 * 1024 * 1024
+            )
+            logger.info(f"🌐 WebSocket服务器启动在 {host}:{ws_port}")
+            logger.info(f"   Ping间隔: {ping_interval}s, Ping超时: {ping_timeout}s")
+        except Exception as e:
+            self.running = False
+            raise e
+
+        # 等待停止信号或服务器关闭
+        stop_task = asyncio.create_task(self.stop_event.wait())
+        close_task = asyncio.create_task(self.websocket_server.wait_closed())
+        await asyncio.wait(
+            [stop_task, close_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        # 取消未完成的任务
+        for task in (stop_task, close_task):
+            if not task.done():
+                task.cancel()
+
+        # 关闭服务器
+        if self.websocket_server:
+            self.websocket_server.close()
+            await self.websocket_server.wait_closed()
+
+        self.running = False
+        logger.info("WebSocket 服务器已停止")
+
+    async def stop(self):
+        """停止服务器，等待完全关闭"""
+        if not self.running:
+            logger.debug("服务器已经停止")
+            return
+
+        logger.info("正在停止 WebSocket 服务器...")
+        self.stop_event.set()
+        # 等待 start 完全退出
+        while self.running:
+            await asyncio.sleep(0.05)
+        # 确保服务器完全关闭
+        if self.websocket_server:
+            self.websocket_server.close()
+            await self.websocket_server.wait_closed()
+        logger.info("WebSocket 服务器已完全停止")
+
+    async def handle_client(self, websocket: websockets.WebSocketServerProtocol):
+        """处理新连接（区分设备或网页）"""
+        try:
+            message = await asyncio.wait_for(websocket.recv(), timeout=10.0)
             try:
                 data = json.loads(message)
-                client_id = data.get('deviceId', str(id(websocket)))
-
-                if client_id not in self.device_info:
-                    self.device_info[client_id] = {
-                        "first_seen": datetime.now().isoformat(),
-                        "device_model": data.get('device', {}).get('model', 'Unknown'),
-                        "device_manufacturer": data.get('device', {}).get('manufacturer', 'Unknown'),
-                    }
-
-                logger.info(f"📱 设备 {client_id} 连接成功")
             except json.JSONDecodeError:
-                client_id = str(id(websocket))
-                logger.warning(f"客户端 {client_id} 发送了无效的JSON")
+                logger.warning("收到非JSON消息，关闭连接")
+                await websocket.close()
                 return
 
-            self.clients[client_id] = websocket
-            self.device_last_seen[client_id] = time.time()
+            if 'deviceId' in data:
+                await self.handle_device(websocket, data)
+            elif data.get('type') == 'web':
+                await self.handle_web(websocket)
+            else:
+                logger.warning("未知连接类型，关闭")
+                await websocket.close()
+        except asyncio.TimeoutError:
+            logger.warning("连接超时，未收到初始消息")
+            await websocket.close()
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        except Exception as e:
+            logger.error(f"处理连接时出错: {e}")
 
+    async def handle_device(self, websocket: websockets.WebSocketServerProtocol, init_data: dict):
+        """处理设备客户端"""
+        client_id = init_data.get('deviceId', str(id(websocket)))
+        self.device_clients[client_id] = websocket
+        self.device_last_seen[client_id] = time.time()
+
+        if client_id not in self.device_info:
+            self.device_info[client_id] = {
+                "first_seen": datetime.now().isoformat(),
+                "device_model": init_data.get('device', {}).get('model', 'Unknown'),
+                "device_manufacturer": init_data.get('device', {}).get('manufacturer', 'Unknown'),
+            }
+        logger.info(f"📱 设备 {client_id} 连接成功")
+
+        try:
             await websocket.send(json.dumps({
                 "type": "welcome",
                 "timestamp": int(time.time() * 1000),
                 "message": "连接成功! 等待数据接收..."
             }))
+        except:
+            pass
 
+        try:
             async for message in websocket:
                 await self.process_message(client_id, message)
-
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"🔴 设备 {client_id} 连接断开")
-        except Exception as e:
-            logger.error(f"❌ 处理客户端 {client_id} 时出错: {e}")
         finally:
-            if client_id and client_id in self.clients:
-                del self.clients[client_id]
-                if client_id in self.device_last_seen:
-                    del self.device_last_seen[client_id]
+            self.device_clients.pop(client_id, None)
+            self.device_last_seen.pop(client_id, None)
+
+    async def handle_web(self, websocket: websockets.WebSocketServerProtocol):
+        """处理网页客户端"""
+        self.web_clients.add(websocket)
+        logger.info(f"🌐 网页客户端连接 (当前 {len(self.web_clients)} 个)")
+        await self.send_stats_to_web(websocket)
+        try:
+            await websocket.wait_closed()
+        except:
+            pass
+        finally:
+            self.web_clients.discard(websocket)
+            logger.info(f"🌐 网页客户端断开 (剩余 {len(self.web_clients)} 个)")
 
     async def process_message(self, client_id: str, message: str):
+        """处理设备发来的消息"""
         try:
             data = json.loads(message)
             data_type = data.get('dataType', 'unknown')
@@ -151,16 +251,17 @@ class DeviceDataServer:
             elif data_type == 'diff':
                 await self.handle_partial_data(client_id, data)
 
+            await self.broadcast_stats()
         except json.JSONDecodeError as e:
             logger.error(f"JSON解析错误: {e}")
         except Exception as e:
             logger.error(f"处理消息时出错: {e}")
 
     async def handle_full_data(self, client_id: str, data: Dict[str, Any]):
-        logger.info(f"📥 收到设备 {client_id} 的完整数据")
+        logger.debug(f"📥 收到设备 {client_id} 的完整数据")
 
     async def handle_partial_data(self, client_id: str, data: Dict[str, Any]):
-        logger.info(f"📥 收到设备 {client_id} 的增量数据")
+        logger.debug(f"📥 收到设备 {client_id} 的增量数据")
 
     def save_data_to_file(self, client_id: str, data: Dict[str, Any]):
         try:
@@ -172,9 +273,10 @@ class DeviceDataServer:
             logger.error(f"❌ 保存数据失败: {e}")
 
     def get_device_stats(self) -> Dict[str, Any]:
+        """构建当前设备状态统计（用于推送）"""
         now = time.time()
         stats = {
-            "total_clients": len(self.clients),
+            "total_clients": len(self.device_clients),
             "active_devices": len([c for c, t in self.device_last_seen.items() if now - t < 300]),
             "total_messages": self.total_messages,
             "devices": {}
@@ -184,10 +286,8 @@ class DeviceDataServer:
             last_seen = self.device_last_seen.get(client_id, 0)
             info = self.device_info.get(client_id, {})
             data_timestamp = data.get('timestamp', 0)
-            
-            # 提取网络信息
             network = data.get('network', {})
-            
+
             stats["devices"][client_id] = {
                 "last_seen": datetime.fromtimestamp(last_seen).isoformat() if last_seen else None,
                 "data_timestamp": data_timestamp,
@@ -203,7 +303,6 @@ class DeviceDataServer:
                 "screen_width": info.get('screen_width', 1080),
                 "screen_height": info.get('screen_height', 2400),
                 "first_seen": info.get('first_seen', 'Unknown'),
-                # 网络信息
                 "network": {
                     "type": network.get('type', '未知'),
                     "detail": network.get('detail', ''),
@@ -225,24 +324,48 @@ class DeviceDataServer:
                     "totalTx": network.get('totalTx', 0),
                     "totalRxStr": network.get('totalRxStr', '0 B'),
                     "totalTxStr": network.get('totalTxStr', '0 B')
-                } if network else None
+                } if network else None,
+                "battery": data.get('battery', {}),
+                "foreground": data.get('foreground', {}),
+                "memory": data.get('memory', {}),
+                "storage": data.get('storage', {}),
+                "screen": data.get('screen', {}),
+                "location": data.get('location', {}),
+                "sensors": data.get('sensors', {})
             }
 
         return stats
 
+    async def send_stats_to_web(self, websocket: websockets.WebSocketServerProtocol):
+        try:
+            stats = self.get_device_stats()
+            await websocket.send(json.dumps(stats))
+        except Exception as e:
+            logger.error(f"发送状态到网页失败: {e}")
 
-# ==================== HTML页面 ====================
+    async def broadcast_stats(self):
+        if not self.web_clients:
+            return
+        stats = self.get_device_stats()
+        data = json.dumps(stats)
+        for ws in list(self.web_clients):
+            try:
+                await ws.send(data)
+            except:
+                self.web_clients.discard(ws)
+
+
+# ==================== HTML页面（前端使用 WebSocket） ====================
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>📱 设备数据监控</title>
+    <title>📱 设备数据监控 (实时)</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', Arial, sans-serif; background: #0a0e17; color: #e0e0e0; padding: 20px; }
         .container { max-width: 1600px; margin: 0 auto; }
-        
         .header { 
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
             padding: 25px 30px; 
@@ -260,10 +383,8 @@ HTML_PAGE = """
         .header .stats-info .stat-item { text-align: center; }
         .header .stats-info .stat-item .num { font-size: 28px; font-weight: 700; color: #00d4ff; }
         .header .stats-info .stat-item .label { font-size: 12px; color: #8899aa; }
-        
         .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
         @media (max-width: 1200px) { .grid { grid-template-columns: 1fr; } }
-        
         .card {
             background: rgba(20, 30, 50, 0.9);
             border-radius: 16px;
@@ -273,7 +394,6 @@ HTML_PAGE = """
         }
         .card:hover { border-color: rgba(100, 200, 255, 0.2); }
         .card.offline { opacity: 0.5; }
-        
         .card-header {
             padding: 15px 20px;
             cursor: pointer;
@@ -309,10 +429,8 @@ HTML_PAGE = """
         .card-header .device-status .dot.offline { background: #ff4444; }
         .card-header .toggle-icon { font-size: 18px; transition: transform 0.3s; display: inline-block; }
         .card-header .toggle-icon.open { transform: rotate(180deg); }
-        
         .card-body { display: none; padding: 20px; }
         .card-body.open { display: block; }
-        
         .data-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -330,78 +448,28 @@ HTML_PAGE = """
         .data-item .value.warning { color: #ffaa00; }
         .data-item .value.danger { color: #ff4444; }
         .data-item .sub { font-size: 11px; color: #667788; margin-top: 2px; }
-        
         .empty-state {
             text-align: center;
             padding: 60px 20px;
             color: #8899aa;
         }
         .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
-        
         .full-width { grid-column: 1 / -1; }
-        
         .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
         @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
-        
-        .sensor-section {
+        .placeholder-section {
             background: rgba(0, 0, 0, 0.2);
             border-radius: 12px;
             padding: 16px;
             min-height: 200px;
-        }
-        .sensor-section .section-title {
-            font-size: 13px;
-            color: #8899aa;
-            margin-bottom: 12px;
             display: flex;
             align-items: center;
-            gap: 10px;
-        }
-        .sensor-section .section-title .count {
-            background: rgba(0, 200, 255, 0.15);
-            padding: 0 10px;
-            border-radius: 12px;
-            font-size: 12px;
-            color: #00d4ff;
-        }
-        
-        .sensor-grid-full {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 8px;
-        }
-        .sensor-item-full {
-            background: rgba(0, 0, 0, 0.25);
-            padding: 10px 14px;
-            border-radius: 8px;
-            border-left: 3px solid #00d4ff;
-            display: flex;
-            flex-direction: column;
-        }
-        .sensor-item-full .sensor-name {
-            font-size: 11px;
-            color: #8899aa;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        .sensor-item-full .sensor-value {
-            font-size: 15px;
-            font-weight: 600;
-            color: #00d4ff;
-            margin-top: 2px;
-            font-family: monospace;
-        }
-        .sensor-item-full .sensor-value.good { color: #00ff88; }
-        .sensor-item-full .sensor-value.warning { color: #ffaa00; }
-        .sensor-item-full .sensor-value.danger { color: #ff4444; }
-        
-        .no-sensor {
-            color: #556677;
-            font-size: 13px;
+            justify-content: center;
+            color: #667788;
+            font-size: 16px;
             text-align: center;
-            padding: 30px 0;
+            border: 1px dashed rgba(100, 200, 255, 0.15);
         }
-        
         .card-footer {
             padding: 10px 20px;
             background: rgba(0, 0, 0, 0.15);
@@ -421,8 +489,6 @@ HTML_PAGE = """
             color: #00d4ff;
             font-family: monospace;
         }
-
-        /* 网络状态指示 */
         .network-status {
             display: flex;
             align-items: center;
@@ -434,15 +500,12 @@ HTML_PAGE = """
         }
         .network-status .connected { color: #00ff88; }
         .network-status .disconnected { color: #ff4444; }
-        
-        .speed-display {
-            display: flex;
-            gap: 16px;
-            font-size: 13px;
-            font-family: monospace;
+        .connection-status {
+            font-size: 14px;
+            color: #8899aa;
         }
-        .speed-display .down { color: #00d4ff; }
-        .speed-display .up { color: #ffaa00; }
+        .connection-status .connected { color: #00ff88; }
+        .connection-status .disconnected { color: #ff4444; }
     </style>
 </head>
 <body>
@@ -451,6 +514,7 @@ HTML_PAGE = """
         <div>
             <h1><span>Ext</span>Link</h1>
             <div style="font-size:13px;color:#8899aa;margin-top:4px;">
+                <span class="connection-status" id="connStatus">⏳ 连接中...</span>
             </div>
         </div>
         <div class="stats-info">
@@ -464,66 +528,16 @@ HTML_PAGE = """
     <div class="grid" id="devicesContainer">
         <div class="full-width empty-state">
             <div class="icon">📡</div>
+            <p>等待数据...</p>
         </div>
     </div>
 </div>
 
 <script>
-    // ==================== 状态管理 ====================
-    var deviceDataCache = {};
-    var deviceStats = { total_clients: 0, total_messages: 0 };
     var cardStates = {};
-    var isUpdating = false;
-    var pendingUpdate = false;
-    
-    // 传感器中文名称映射
-    var sensorNameMap = {
-        'accelerometer': '加速度计',
-        'gyroscope': '陀螺仪',
-        'magnetic_field': '磁力计',
-        'gravity': '重力',
-        'linear_acceleration': '线性加速度',
-        'orientation': '方向',
-        'light': '光线',
-        'proximity': '距离',
-        'ambient_temperature': '环境温度',
-        'pressure': '压力',
-        'relative_humidity': '相对湿度',
-        'temperature': '温度',
-        'step_counter': '计步器',
-        'heart_rate': '心率',
-        'battery': '电池'
-    };
+    var ws = null;
+    var reconnectTimer = null;
 
-    // ==================== 格式化工具 ====================
-    function formatSensorValue(val) {
-        if (val === undefined || val === null) return 'N/A';
-        if (typeof val === 'object') {
-            if (val.x !== undefined && val.x !== null) {
-                return val.x.toFixed(2) + ', ' + val.y.toFixed(2) + ', ' + val.z.toFixed(2);
-            } else if (val.value !== undefined && val.value !== null) {
-                return val.value.toFixed(1);
-            }
-            return JSON.stringify(val).substring(0, 40);
-        }
-        return String(val);
-    }
-
-    function getSensorValueClass(val) {
-        if (val === undefined || val === null) return '';
-        if (typeof val === 'object') {
-            if (val.value !== undefined) {
-                var num = parseFloat(val.value);
-                if (!isNaN(num)) {
-                    if (num > 80) return 'good';
-                    if (num > 30) return 'warning';
-                    return 'danger';
-                }
-            }
-        }
-        return '';
-    }
-    
     function formatTimestamp(ts) {
         if (!ts || ts <= 0) return '未知';
         try {
@@ -542,61 +556,60 @@ HTML_PAGE = """
         }
     }
 
-    // ==================== UI渲染 ====================
     function renderDevices(data) {
         var container = document.getElementById('devicesContainer');
         if (!container) return;
 
         var deviceKeys = Object.keys(data.devices || {});
+        document.getElementById('totalClients').textContent = data.total_clients || 0;
 
         if (deviceKeys.length === 0) {
             container.innerHTML = `
                 <div class="full-width empty-state">
                     <div class="icon">📡</div>
+                    <p>暂无设备连接</p>
                 </div>
             `;
             return;
         }
 
         var html = '';
-
         for (var clientId in data.devices) {
             var dev = data.devices[clientId];
-            var detail = deviceDataCache[clientId] || {};
             var isOnline = dev.last_seen !== null;
 
-            var battery = detail.battery || {};
+            var battery = dev.battery || {};
             var batteryLevel = battery.level !== undefined ? battery.level : '?';
             var batteryClass = batteryLevel >= 50 ? 'good' : (batteryLevel >= 20 ? 'warning' : 'danger');
 
-            var foreground = detail.foreground || {};
+            var foreground = dev.foreground || {};
             var fgName = foreground.packageName || 'Unknown';
 
-            var memory = detail.memory || {};
+            var memory = dev.memory || {};
             var memoryTotal = memory.total || 0;
             var memoryUsed = memory.used || 0;
             var memoryMB = memoryTotal > 0 ? (memoryTotal / 1024 / 1024).toFixed(0) : '?';
             var memoryUsedMB = memoryUsed > 0 ? (memoryUsed / 1024 / 1024).toFixed(0) : '?';
             var memoryPercent = memory.usagePercent || '?';
 
-            var storage = detail.storage || {};
+            var storage = dev.storage || {};
             var storageTotal = storage.total || 0;
             var storageUsed = storage.used || 0;
             var storageGB = storageTotal > 0 ? (storageTotal / 1024 / 1024 / 1024).toFixed(1) : '?';
             var storageUsedGB = storageUsed > 0 ? (storageUsed / 1024 / 1024 / 1024).toFixed(1) : '?';
             var storagePercent = storage.usagePercent || '?';
 
-            var screen = detail.screen || {};
+            var screen = dev.screen || {};
             var screenStatus = screen.isOn ? '🟢 亮屏' : '🔴 熄屏';
             var brightness = screen.brightness || '?';
 
-            var location = detail.location || {};
+            var location = dev.location || {};
             var hasLocation = location.hasLocation || false;
             var locationStr = hasLocation ? location.latitude.toFixed(4) + ', ' + location.longitude.toFixed(4) : '未获取';
 
-            var sensors = detail.sensors || {};
+            var sensors = dev.sensors || {};
+            var sensorCount = Object.keys(sensors).length;
 
-            // ===== 网络信息 =====
             var network = dev.network || {};
             var netType = network.type || '未知';
             var netConnected = network.isConnected || false;
@@ -606,7 +619,6 @@ HTML_PAGE = """
             var netIntervalTx = network.intervalTxStr || '0 B';
             var netTotalRx = network.totalRxStr || '0 B';
             var netTotalTx = network.totalTxStr || '0 B';
-            var netIp = network.ip || '未知';
             var netDetail = network.detail || '';
             var netSignalLevel = network.signalLevel || '';
             var netTypeDetail = network.networkType || '';
@@ -615,7 +627,6 @@ HTML_PAGE = """
             var deviceManufacturer = dev.device_manufacturer || '';
             var screenWidth = dev.screen_width || 1080;
             var screenHeight = dev.screen_height || 2400;
-            
             var dataTimestamp = dev.data_timestamp || 0;
             var updateTimeStr = formatTimestamp(dataTimestamp);
 
@@ -626,56 +637,11 @@ HTML_PAGE = """
             var isOpen = cardStates[clientId] || false;
             var toggleClass = isOpen ? 'open' : '';
 
-            // ===== 构建传感器列表 =====
-            var sensorKeys = Object.keys(sensors);
-            var sensorHtml = '';
-            
-            var priorityOrder = ['accelerometer', 'gyroscope', 'magnetic_field', 'gravity', 'linear_acceleration', 'orientation', 'light', 'proximity', 'ambient_temperature', 'pressure', 'relative_humidity'];
-            var sortedKeys = [];
-            for (var i = 0; i < priorityOrder.length; i++) {
-                if (sensors[priorityOrder[i]]) {
-                    sortedKeys.push(priorityOrder[i]);
-                }
-            }
-            for (var i = 0; i < sensorKeys.length; i++) {
-                if (sortedKeys.indexOf(sensorKeys[i]) === -1) {
-                    sortedKeys.push(sensorKeys[i]);
-                }
-            }
-
-            if (sortedKeys.length > 0) {
-                for (var i = 0; i < sortedKeys.length; i++) {
-                    var key = sortedKeys[i];
-                    var val = sensors[key];
-                    if (!val) continue;
-                    
-                    var displayVal = formatSensorValue(val);
-                    var valueClass = getSensorValueClass(val);
-                    var label = sensorNameMap[key] || key;
-                    
-                    sensorHtml += `
-                        <div class="sensor-item-full">
-                            <span class="sensor-name">${label}</span>
-                            <span class="sensor-value ${valueClass}">${displayVal}</span>
-                        </div>
-                    `;
-                }
-            } else {
-                sensorHtml = '<div class="no-sensor">📡 暂无传感器数据</div>';
-            }
-
-            var sensorCount = sortedKeys.length;
-
-            // ===== 网络状态图标 =====
             var netIcon = netConnected ? '✅' : '❌';
             var netStatusClass = netConnected ? 'connected' : 'disconnected';
             var netTypeDisplay = netType;
-            if (netTypeDetail) {
-                netTypeDisplay += ' (' + netTypeDetail + ')';
-            }
-            if (netSignalLevel) {
-                netTypeDisplay += ' 信号: ' + netSignalLevel;
-            }
+            if (netTypeDetail) netTypeDisplay += ' (' + netTypeDetail + ')';
+            if (netSignalLevel) netTypeDisplay += ' 信号: ' + netSignalLevel;
 
             html += `
             <div class="card ${isOnline ? '' : 'offline'}" id="${cardId}">
@@ -732,8 +698,12 @@ HTML_PAGE = """
                                     <div class="value" style="font-size:13px;">${locationStr}</div>
                                     <div class="sub">${hasLocation ? '✅ GPS定位' : '❌ 无定位'}</div>
                                 </div>
+                                <div class="data-item">
+                                    <div class="label">📡 传感器数据</div>
+                                    <div class="value">${sensorCount} 个</div>
+                                    <div class="sub">传感器总数</div>
+                                </div>
                             </div>
-                            <!-- 网络详细信息 -->
                             <div class="data-grid" style="margin-top:10px;">
                                 <div class="data-item" style="border-left-color:#00d4ff;">
                                     <div class="label">🌐 网络</div>
@@ -757,14 +727,8 @@ HTML_PAGE = """
                             </div>
                         </div>
                         <div>
-                            <div class="sensor-section">
-                                <div class="section-title">
-                                    📡 传感器数据
-                                    <span class="count">${sensorCount} 个</span>
-                                </div>
-                                <div class="sensor-grid-full">
-                                    ${sensorHtml}
-                                </div>
+                            <div class="placeholder-section">
+                                📊 点击右侧数据查看详细历史记录
                             </div>
                         </div>
                     </div>
@@ -776,11 +740,9 @@ HTML_PAGE = """
             </div>
             `;
         }
-
         container.innerHTML = html;
     }
 
-    // ==================== 折叠切换 ====================
     function toggleCard(bodyId, clientId) {
         var body = document.getElementById(bodyId);
         var toggle = document.getElementById('toggle-' + bodyId);
@@ -798,73 +760,61 @@ HTML_PAGE = """
         }
     }
 
-    // ==================== API调用 ====================
-    function updateStats() {
-        if (isUpdating) {
-            pendingUpdate = true;
-            return;
-        }
-        isUpdating = true;
-        pendingUpdate = false;
-        
-        fetch('/api/stats')
-            .then(response => response.json())
-            .then(data => {
-                deviceStats = data;
-                document.getElementById('totalClients').textContent = data.total_clients || 0;
+    function connectWebSocket() {
+        var protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        var wsUrl = protocol + '//' + window.location.hostname + ':' + {{WS_PORT}};
+        ws = new WebSocket(wsUrl);
 
-                var currentStates = {};
-                for (var id in cardStates) {
-                    currentStates[id] = cardStates[id];
-                }
+        ws.onopen = function() {
+            document.getElementById('connStatus').innerHTML = '🟢 已连接 (实时)';
+            document.getElementById('connStatus').className = 'connection-status connected';
+            ws.send(JSON.stringify({type: 'web'}));
+            if (reconnectTimer) {
+                clearInterval(reconnectTimer);
+                reconnectTimer = null;
+            }
+        };
 
+        ws.onmessage = function(event) {
+            try {
+                var data = JSON.parse(event.data);
                 renderDevices(data);
-
-                for (var id in currentStates) {
-                    if (currentStates[id]) {
+                // 恢复展开状态
+                for (var id in cardStates) {
+                    if (cardStates[id]) {
                         var bodyId = 'body-' + id.replace(/[^a-zA-Z0-9]/g, '_');
                         var body = document.getElementById(bodyId);
                         var toggle = document.getElementById('toggle-' + bodyId);
                         if (body) {
                             body.classList.add('open');
                             if (toggle) toggle.classList.add('open');
-                            cardStates[id] = true;
                         }
                     }
                 }
+            } catch (e) {
+                console.error('解析数据失败:', e);
+            }
+        };
 
-                isUpdating = false;
-                if (pendingUpdate) {
-                    pendingUpdate = false;
-                    updateStats();
-                }
-            })
-            .catch(err => {
-                console.error('Error:', err);
-                isUpdating = false;
-                if (pendingUpdate) {
-                    pendingUpdate = false;
-                    updateStats();
-                }
-            });
+        ws.onclose = function() {
+            document.getElementById('connStatus').innerHTML = '🔴 连接断开 (重连中...)';
+            document.getElementById('connStatus').className = 'connection-status disconnected';
+            if (!reconnectTimer) {
+                reconnectTimer = setInterval(function() {
+                    if (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING) {
+                        connectWebSocket();
+                    }
+                }, 3000);
+            }
+        };
+
+        ws.onerror = function(err) {
+            console.error('WebSocket错误:', err);
+        };
     }
 
-    function fetchDeviceData() {
-        fetch('/api/devices')
-            .then(response => response.json())
-            .then(data => {
-                deviceDataCache = data;
-            })
-            .catch(err => console.error('Error:', err));
-    }
-
-    // ==================== 启动 ====================
-    setInterval(updateStats, 5000);
-    setInterval(fetchDeviceData, 3000);
-    updateStats();
-    fetchDeviceData();
-
-    console.log('📱 DeviceMonitor 已启动');
+    connectWebSocket();
+    console.log('📱 DeviceMonitor (实时推送) 已启动');
 </script>
 </body>
 </html>
@@ -881,65 +831,173 @@ async def web_handler(request):
     return web.Response(body=get_html().encode('utf-8'), content_type='text/html')
 
 
-async def main():
-    import sys
+# ==================== 终端命令处理 ====================
+async def stdin_reader(server: DeviceDataServer):
+    loop = asyncio.get_event_loop()
+    help_text = """
+可用命令:
+  .reload_conf        - 重新加载配置文件并重启服务器
+  .force_update       - 强制所有设备上传数据（暂未实现）
+  .log_level <level>  - 设置日志级别 (0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR)
+  .help               - 显示此帮助信息
+  .exit               - 退出服务器
+"""
+    print(help_text)
+    while True:
+        try:
+            line = await loop.run_in_executor(None, sys.stdin.readline)
+            if not line:
+                break
+            cmd = line.strip()
+            if not cmd:
+                continue
+            if cmd == '.help':
+                print(help_text)
+            elif cmd == '.exit':
+                logger.info("收到退出命令，正在关闭服务器...")
+                asyncio.get_event_loop().stop()
+                break
+            elif cmd == '.reload_conf':
+                await handle_reload(server)
+            elif cmd == '.force_update':
+                logger.info("🔧 .force_update 命令已收到（暂未实现）")
+            elif cmd.startswith('.log_level'):
+                parts = cmd.split()
+                if len(parts) == 2:
+                    try:
+                        level = int(parts[1])
+                        if level in (0, 1, 2, 3):
+                            await handle_log_level(level)
+                        else:
+                            print("日志级别必须是 0, 1, 2, 3")
+                    except ValueError:
+                        print("日志级别必须是数字")
+                else:
+                    print("用法: .log_level <0|1|2|3>")
+            else:
+                print(f"未知命令: {cmd}，输入 .help 查看帮助")
+        except Exception as e:
+            logger.error(f"终端命令处理错误: {e}")
 
+async def handle_reload(server: DeviceDataServer):
+    global CONFIG
+    logger.info("🔄 正在重新加载配置并重启服务器...")
+    await server.stop()  # 等待停止完成
     try:
-        from aiohttp import web
-        HAS_AIOHTTP = True
-    except ImportError:
-        HAS_AIOHTTP = False
-        logger.warning("⚠️ aiohttp未安装，Web界面将不可用")
-        logger.warning("💡 安装命令: pip install aiohttp")
-        web = None
+        new_config = load_config()
+        CONFIG = new_config
+        log_level = CONFIG.get('log_level', 0)
+        set_log_level(log_level)
+        logger.info("✅ 配置文件已重新加载")
+    except Exception as e:
+        logger.error(f"❌ 重载配置失败: {e}")
+    # 设置重启标志
+    asyncio.get_event_loop().call_soon(setattr, sys.modules[__name__], 'need_restart', True)
+
+need_restart = False
+
+async def handle_log_level(level: int):
+    global CONFIG
+    CONFIG['log_level'] = level
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(CONFIG, f, indent=2, ensure_ascii=False)
+        set_log_level(level)
+        logger.info(f"✅ 日志级别已设置为 {level}，并保存到配置文件")
+    except Exception as e:
+        logger.error(f"❌ 保存配置失败: {e}")
+
+
+# ==================== 主程序 ====================
+async def main():
+    global need_restart
+    from aiohttp import web
 
     server = DeviceDataServer()
-
     ws_port = CONFIG.get("ws_port", 32767)
     web_port = CONFIG.get("web_port", 8080)
     host = CONFIG.get("host", "0.0.0.0")
 
     logger.info("=" * 80)
-    logger.info("📱 设备数据接收服务器 v8.0 (网络监控版)")
+    logger.info("📱 设备数据接收服务器 v9.5 (完整稳定版)")
     logger.info("=" * 80)
     logger.info(f"🌐 WebSocket: ws://{host}:{ws_port}")
     logger.info(f"🌐 Web界面: http://{host}:{web_port}")
     logger.info(f"📁 数据目录: {DATA_DIR}")
     logger.info("📝 配置文件: server_config.json")
+    logger.info("💡 在终端输入 .help 查看命令")
     logger.info("=" * 80)
 
-    ws_task = asyncio.create_task(server.start())
-
-    if HAS_AIOHTTP:
-        try:
-            async def stats_handler(request):
-                return web.json_response(server.get_device_stats())
-
-            async def devices_handler(request):
-                return web.json_response(server.device_data)
-
-            app = web.Application()
-            app['server'] = server
-
-            app.router.add_get('/', web_handler)
-            app.router.add_get('/api/stats', stats_handler)
-            app.router.add_get('/api/devices', devices_handler)
-
-            runner = web.AppRunner(app)
-            await runner.setup()
-            site = web.TCPSite(runner, host, web_port)
-            await site.start()
-            logger.info(f"✅ Web界面: http://localhost:{web_port}")
-        except Exception as e:
-            logger.warning(f"⚠️ Web界面启动失败: {e}")
-
+    # 启动 Web 服务
     try:
-        await ws_task
-    except KeyboardInterrupt:
-        logger.info("🛑 服务器正在关闭...")
-        server.running = False
-    finally:
-        await asyncio.sleep(0.5)
+        async def stats_handler(request):
+            return web.json_response(server.get_device_stats())
+
+        async def devices_handler(request):
+            return web.json_response(server.device_data)
+
+        app = web.Application()
+        app.router.add_get('/', web_handler)
+        app.router.add_get('/api/stats', stats_handler)
+        app.router.add_get('/api/devices', devices_handler)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host, web_port)
+        await site.start()
+        logger.info(f"✅ Web界面: http://localhost:{web_port}")
+    except Exception as e:
+        logger.warning(f"⚠️ Web界面启动失败: {e}")
+
+    stdin_task = asyncio.create_task(stdin_reader(server))
+
+    ws_task = None
+    need_restart = True  # 首次启动
+
+    while True:
+        if need_restart:
+            # 如果已有任务，先确保它完全停止
+            if ws_task is not None:
+                if not ws_task.done():
+                    ws_task.cancel()
+                    try:
+                        await ws_task
+                    except asyncio.CancelledError:
+                        pass
+                    except:
+                        pass
+                ws_task = None
+            # 强制停止服务器（防止残留）
+            await server.stop()
+            need_restart = False
+            # 启动新服务器
+            try:
+                ws_task = asyncio.create_task(server.start())
+                logger.info("WebSocket 服务器启动任务已创建")
+            except Exception as e:
+                logger.error(f"创建启动任务失败: {e}")
+                await asyncio.sleep(5)
+                need_restart = True
+                continue
+
+        # 检查任务状态
+        if ws_task is not None and ws_task.done():
+            try:
+                await ws_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"WebSocket 服务器异常退出: {e}")
+            ws_task = None
+            logger.info("等待 5 秒后尝试重启...")
+            await asyncio.sleep(5)
+            need_restart = True
+            continue
+
+        await asyncio.sleep(0.2)
+
+    stdin_task.cancel()
+    await server.stop()
 
 
 if __name__ == "__main__":

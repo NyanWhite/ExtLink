@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 # ==================== 配置 ====================
 CONFIG = {
     "deviceId": None,  # 将在初始化时设置
-    "wsServer": "localhost:32767",
-    "updateInterval": 5,  # 数据上传间隔（秒）
+    "wsServer": "localhost:81",
+    "updateInterval": 1,  # 数据上传间隔（秒）
     "collectBasicInfo": True,
     "collectBattery": True,
     "collectForegroundApp": True,

@@ -370,20 +370,20 @@ var SCREEN_INFO = getScreenInfo();
 
 var CONFIG = {
     "deviceId": DEVICE_ID,
-    "wsServer": "localhost:32767",
+    "wsServer": "localhost:80",
     "updateInterval": 5,  // 数据上传间隔（秒）
-    "collectBasicInfo": true,
-    "collectBattery": true,
-    "collectForegroundApp": true,
-    "collectMemory": true,
-    "collectScreenState": true,
-    "collectStorageInfo": true,
-    "collectCpuInfo": true,
-    "collectLocation": true,
-    "collectSensor": true,
-    "collectProcesses": true,
-    "collectPackages": true,
-    "collectNetwork": true  // 网络监控开关
+    "collectBasicInfo": false,
+    "collectBattery": false,
+    "collectForegroundApp": false,
+    "collectMemory": false,
+    "collectScreenState": false,
+    "collectStorageInfo": false,
+    "collectCpuInfo": false,
+    "collectLocation": false,
+    "collectSensor": false,
+    "collectProcesses": false,
+    "collectPackages": false,
+    "collectNetwork": false  // 网络监控开关
 };
 
 // ==================== 打印设备信息 ====================
