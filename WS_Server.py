@@ -3,6 +3,7 @@
 # 电池速率算法：双模式（历史极值+容量修正 / RAM段+即时两点+电流回退）
 # 亮度单位已修正，不再自动缩放
 # 性能优化：折叠卡片销毁图表、防抖渲染、增量更新检查展开状态
+# 自适应降采样（LTTB），目标点数可通过 server_config.json 的 chart_max_points 配置
 
 import asyncio
 import json
@@ -46,7 +47,8 @@ DEFAULT_CONFIG = {
         "location",
         "memory",
         "storage"
-    ]
+    ],
+    "chart_max_points": 800   # 图表降采样目标点数，数据量超过此值时自动抽稀
 }
 
 
@@ -857,7 +859,7 @@ HTML_PAGE = """
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>📱 设备数据监控 (智能单位转换)</title>
+    <title>📱 设备数据监控 (智能单位转换 + 自适应降采样)</title>
     <script src="/static/echarts.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1021,6 +1023,101 @@ HTML_PAGE = """
     var chartInstances = {};
     var renderTimer = null;
 
+    // 降采样目标点数（从服务器配置注入）
+    var MAX_POINTS = {{MAX_POINTS}};
+
+    // ==================== LTTB 降采样算法 ====================
+    function lttb(data, threshold) {
+        // data: array of [x, y] pairs, threshold: desired number of output points
+        if (threshold >= data.length) return data.slice();
+        if (threshold < 2) return [data[0], data[data.length-1]];
+
+        var data_length = data.length;
+        var bucket_size = (data_length - 2) / (threshold - 2);
+
+        var sampled = [];
+        var a = 0;
+        sampled.push(data[a]);
+
+        for (var i = 0; i < threshold - 2; i++) {
+            var avg_range_start = Math.floor((i + 1) * bucket_size) + 1;
+            var avg_range_end = Math.floor((i + 2) * bucket_size) + 1;
+            avg_range_end = Math.min(avg_range_end, data_length);
+
+            var avg_x = 0, avg_y = 0;
+            var avg_count = 0;
+            for (var j = avg_range_start; j < avg_range_end; j++) {
+                avg_x += data[j][0];
+                avg_y += data[j][1];
+                avg_count++;
+            }
+            avg_x /= avg_count;
+            avg_y /= avg_count;
+
+            var range_offs = Math.floor((i + 0) * bucket_size) + 1;
+            var range_to = Math.floor((i + 1) * bucket_size) + 1;
+
+            var point_a_x = data[a][0];
+            var point_a_y = data[a][1];
+
+            var max_area = -1;
+            var max_area_point = data[range_offs];
+            var max_area_index = range_offs;
+            for (var k = range_offs; k < range_to; k++) {
+                var area = Math.abs((point_a_x - avg_x) * (data[k][1] - point_a_y) -
+                                   (point_a_x - data[k][0]) * (avg_y - point_a_y)) * 0.5;
+                if (area > max_area) {
+                    max_area = area;
+                    max_area_point = data[k];
+                    max_area_index = k;
+                }
+            }
+            sampled.push(max_area_point);
+            a = max_area_index;
+        }
+
+        sampled.push(data[data_length - 1]);
+        return sampled;
+    }
+
+    function downsampleSeries(timestamps, series, targetPoints) {
+        if (timestamps.length <= targetPoints) {
+            return { timestamps: timestamps, series: series };
+        }
+        var keys = Object.keys(series);
+        if (keys.length === 0) return { timestamps: timestamps, series: series };
+
+        var downsampled = {};
+        var sampledTimestamps = null;
+        keys.forEach(function(key) {
+            var values = series[key];
+            var points = timestamps.map(function(ts, idx) {
+                return [ts, values[idx] !== undefined ? values[idx] : null];
+            });
+            // 用前一个值填充 null，使数据连续
+            var filled = [];
+            var lastValid = null;
+            for (var i = 0; i < points.length; i++) {
+                if (points[i][1] !== null && points[i][1] !== undefined) {
+                    lastValid = points[i][1];
+                    filled.push(points[i]);
+                } else if (lastValid !== null) {
+                    filled.push([points[i][0], lastValid]);
+                } else {
+                    filled.push([points[i][0], null]);
+                }
+            }
+            var sampledPoints = lttb(filled, targetPoints);
+            var tsArr = sampledPoints.map(function(p) { return p[0]; });
+            var valArr = sampledPoints.map(function(p) { return p[1]; });
+            downsampled[key] = valArr;
+            if (sampledTimestamps === null) {
+                sampledTimestamps = tsArr;
+            }
+        });
+        return { timestamps: sampledTimestamps, series: downsampled };
+    }
+
     // ==================== 格式化 ====================
     function formatTimestamp(ts) {
         if (!ts || ts <= 0) return '未知';
@@ -1131,7 +1228,7 @@ HTML_PAGE = """
         var container = document.getElementById(containerId);
         if (!container) return null;
         var chart = echarts.init(container, 'dark');
-        chartInstances[deviceId] = { chart: chart, currentModule: null, seriesData: { timestamps: [], fields: {} } };
+        chartInstances[deviceId] = { chart: chart, currentModule: null, rawData: null, currentZoom: [0, 100] };
         window.addEventListener('resize', function() { chart.resize(); });
         return chart;
     }
@@ -1145,34 +1242,81 @@ HTML_PAGE = """
         }
         var chart = inst.chart;
         inst.currentModule = module;
-        inst.seriesData = {
+        inst.rawData = {
             timestamps: data.timestamps || [],
-            fields: data.series || {}
+            series: data.series || {}
         };
+        // 重置zoom范围
+        inst.currentZoom = [0, 100];
+        updateChartWithSampling(deviceId);
 
-        var timestamps = inst.seriesData.timestamps;
-        var fields = Object.keys(inst.seriesData.fields);
-        if (!timestamps.length || !fields.length) {
-            chart.clear();
-            chart.setOption({
+        chart.off('dataZoom');
+        chart.on('dataZoom', function(params) {
+            var zoom = params.batch ? params.batch[0] : params;
+            var start = zoom.start || 0;
+            var end = zoom.end || 100;
+            inst.currentZoom = [start, end];
+            updateChartWithSampling(deviceId);
+        });
+    }
+
+    function updateChartWithSampling(deviceId) {
+        var inst = chartInstances[deviceId];
+        if (!inst || !inst.rawData) return;
+        var raw = inst.rawData;
+        var timestamps = raw.timestamps;
+        var series = raw.series;
+        if (timestamps.length === 0 || Object.keys(series).length === 0) {
+            inst.chart.clear();
+            inst.chart.setOption({
                 title: { text: '暂无历史数据', left: 'center', top: 'center', textStyle: { color: '#667788', fontSize: 16, fontWeight: 'normal' } }
             });
-            chart.resize();
+            inst.chart.resize();
             return;
         }
 
+        var zoomStart = inst.currentZoom[0] / 100;
+        var zoomEnd = inst.currentZoom[1] / 100;
+        var total = timestamps.length;
+        var startIdx = Math.floor(zoomStart * total);
+        var endIdx = Math.ceil(zoomEnd * total);
+        if (endIdx > total) endIdx = total;
+        if (startIdx < 0) startIdx = 0;
+        if (startIdx >= endIdx) {
+            startIdx = 0;
+            endIdx = total;
+        }
+
+        var subTimestamps = timestamps.slice(startIdx, endIdx);
+        var subSeries = {};
+        var keys = Object.keys(series);
+        keys.forEach(function(key) {
+            subSeries[key] = series[key].slice(startIdx, endIdx);
+        });
+
+        var downsampled;
+        if (subTimestamps.length > MAX_POINTS) {
+            downsampled = downsampleSeries(subTimestamps, subSeries, MAX_POINTS);
+        } else {
+            downsampled = { timestamps: subTimestamps, series: subSeries };
+        }
+
+        var displayTimestamps = downsampled.timestamps;
+        var displaySeries = downsampled.series;
+        var fields = Object.keys(displaySeries);
         var transformedData = {};
         var seriesOptions = [];
+        var module = inst.currentModule;
 
         if (module === 'network') {
-            var netTransformed = transformNetworkFields(fields, inst.seriesData.fields);
+            var netTransformed = transformNetworkFields(fields, displaySeries);
             fields.forEach(function(field) {
                 var item = netTransformed[field];
                 if (item) {
                     transformedData[field] = item;
                 } else {
-                    var raw = inst.seriesData.fields[field];
-                    var result = autoScaleByValue(raw);
+                    var rawVal = displaySeries[field];
+                    var result = autoScaleByValue(rawVal);
                     transformedData[field] = result;
                 }
             });
@@ -1190,8 +1334,8 @@ HTML_PAGE = """
             });
         } else {
             fields.forEach(function(field) {
-                var raw = inst.seriesData.fields[field];
-                var result = transformField(module, field, raw);
+                var rawVal = displaySeries[field];
+                var result = transformField(module, field, rawVal);
                 transformedData[field] = result;
                 seriesOptions.push({
                     name: field + result.unit,
@@ -1209,13 +1353,14 @@ HTML_PAGE = """
             return field + (transformedData[field] ? transformedData[field].unit : '');
         });
 
-        var timeLabels = timestamps.map(function(ts) { return formatTimestampShort(ts); });
+        var timeLabels = displayTimestamps.map(function(ts) { return formatTimestampShort(ts); });
 
         var option = {
             tooltip: {
                 trigger: 'axis',
                 formatter: function(params) {
-                    var ts = timestamps[params[0].dataIndex];
+                    var idx = params[0].dataIndex;
+                    var ts = displayTimestamps[idx];
                     var html = formatTimestamp(ts) + '<br/>';
                     params.forEach(function(p) {
                         html += p.marker + ' ' + p.seriesName + ': ' + p.value + '<br/>';
@@ -1245,8 +1390,8 @@ HTML_PAGE = """
             series: seriesOptions,
             dataZoom: [{
                 type: 'slider',
-                start: 0,
-                end: 100,
+                start: inst.currentZoom[0],
+                end: inst.currentZoom[1],
                 height: 20,
                 bottom: 5,
                 borderColor: '#1a2a3a',
@@ -1255,94 +1400,37 @@ HTML_PAGE = """
                 textStyle: { color: '#8899aa' }
             }]
         };
-        chart.setOption(option, true);
-        chart.resize();
+        inst.chart.setOption(option, true);
+        inst.chart.resize();
     }
 
     function updateChartNewPoint(deviceId, module, timestamp, newData) {
-        // 如果卡片折叠，不更新图表
         var body = document.getElementById('body-' + deviceId.replace(/[^a-zA-Z0-9]/g, '_'));
         if (body && body.style.display === 'none') return;
 
         var inst = chartInstances[deviceId];
-        if (!inst) return;
+        if (!inst || !inst.rawData) return;
         if (inst.currentModule !== module) return;
 
-        var seriesData = inst.seriesData;
-        var fields = Object.keys(seriesData.fields);
-        if (fields.length === 0) return;
+        var raw = inst.rawData;
+        var timestamps = raw.timestamps;
+        var series = raw.series;
 
-        var lastTs = seriesData.timestamps[seriesData.timestamps.length - 1];
-        if (lastTs === timestamp) return;
+        if (timestamps.length > 0 && timestamps[timestamps.length-1] === timestamp) return;
 
-        seriesData.timestamps.push(timestamp);
+        timestamps.push(timestamp);
+        var fields = Object.keys(series);
         fields.forEach(function(field) {
             var val = newData[field];
             if (typeof val === 'boolean') val = val ? 1 : 0;
             if (typeof val === 'number') {
-                seriesData.fields[field].push(val);
+                series[field].push(val);
             } else {
-                seriesData.fields[field].push(null);
+                series[field].push(null);
             }
         });
 
-        var timestamps = seriesData.timestamps;
-        var fields2 = Object.keys(seriesData.fields);
-        var transformedData = {};
-        var seriesOptions = [];
-
-        if (module === 'network') {
-            var netTransformed = transformNetworkFields(fields2, seriesData.fields);
-            fields2.forEach(function(field) {
-                var item = netTransformed[field];
-                if (item) {
-                    transformedData[field] = item;
-                } else {
-                    var raw = seriesData.fields[field];
-                    var result = autoScaleByValue(raw);
-                    transformedData[field] = result;
-                }
-            });
-            fields2.forEach(function(field) {
-                var item = transformedData[field];
-                seriesOptions.push({
-                    name: field + item.unit,
-                    type: 'line',
-                    data: item.data,
-                    smooth: true,
-                    symbol: 'circle',
-                    symbolSize: 3,
-                    connectNulls: true
-                });
-            });
-        } else {
-            fields2.forEach(function(field) {
-                var raw = seriesData.fields[field];
-                var result = transformField(module, field, raw);
-                transformedData[field] = result;
-                seriesOptions.push({
-                    name: field + result.unit,
-                    type: 'line',
-                    data: result.data,
-                    smooth: true,
-                    symbol: 'circle',
-                    symbolSize: 3,
-                    connectNulls: true
-                });
-            });
-        }
-
-        var legendData = fields2.map(function(field) {
-            return field + (transformedData[field] ? transformedData[field].unit : '');
-        });
-        var timeLabels = timestamps.map(function(ts) { return formatTimestampShort(ts); });
-
-        inst.chart.setOption({
-            xAxis: { data: timeLabels },
-            series: seriesOptions,
-            legend: { data: legendData }
-        }, false);
-        inst.chart.resize();
+        updateChartWithSampling(deviceId);
     }
 
     function loadHistory(deviceId, module) {
@@ -1604,7 +1692,6 @@ HTML_PAGE = """
         }
         container.innerHTML = html;
 
-        // 恢复图表容器
         var newRows = container.querySelectorAll('.device-row');
         newRows.forEach(function(row) {
             var cid = row.getAttribute('data-client-id');
@@ -1618,6 +1705,9 @@ HTML_PAGE = """
                     var inst = chartInstances[cid];
                     if (inst && inst.chart) {
                         inst.chart.resize();
+                        if (inst.rawData && inst.rawData.timestamps.length > 0) {
+                            updateChartWithSampling(cid);
+                        }
                     }
                 }
             } else {
@@ -1639,20 +1729,9 @@ HTML_PAGE = """
                 delete chartInstances[id];
             }
         }
-
-        for (var id in chartInstances) {
-            var inst = chartInstances[id];
-            if (inst.currentModule && inst.seriesData.timestamps.length > 0) {
-                var containerId = 'chart-' + id.replace(/[^a-zA-Z0-9]/g, '_');
-                var el = document.getElementById(containerId);
-                if (el && inst.chart) {
-                    inst.chart.resize();
-                }
-            }
-        }
     }
 
-    // ==================== 折叠控制（带图表销毁/重建） ====================
+    // ==================== 折叠控制 ====================
     function toggleCard(bodyId, clientId) {
         var body = document.getElementById(bodyId);
         if (!body) return;
@@ -1671,7 +1750,6 @@ HTML_PAGE = """
         if (!container) return;
 
         if (isOpen) {
-            // 折叠：销毁图表实例
             var inst = chartInstances[clientId];
             if (inst && inst.chart) {
                 inst.chart.dispose();
@@ -1679,10 +1757,9 @@ HTML_PAGE = """
             }
             container.innerHTML = '<div class="chart-placeholder">📊 已折叠</div>';
         } else {
-            // 展开：如果没有实例则创建空图表
             if (!chartInstances[clientId]) {
                 var chart = echarts.init(container, 'dark');
-                chartInstances[clientId] = { chart: chart, currentModule: null, seriesData: { timestamps: [], fields: {} } };
+                chartInstances[clientId] = { chart: chart, currentModule: null, rawData: null, currentZoom: [0, 100] };
                 chart.setOption({
                     title: { text: '点击数据项加载趋势', left: 'center', top: 'center', textStyle: { color: '#667788', fontSize: 16, fontWeight: 'normal' } }
                 });
@@ -1690,7 +1767,6 @@ HTML_PAGE = """
             }
         }
 
-        // 调整大小
         setTimeout(function() {
             var inst2 = chartInstances[clientId];
             if (inst2 && inst2.chart) inst2.chart.resize();
@@ -1724,10 +1800,9 @@ HTML_PAGE = """
                 var msg = JSON.parse(event.data);
                 if (msg.type !== 'history_response') {
                     scheduleRender(msg);
-                    // 更新图表增量（只针对展开的卡片）
                     for (var clientId in msg.devices) {
                         var inst = chartInstances[clientId];
-                        if (!inst || !inst.currentModule) continue;
+                        if (!inst || !inst.currentModule || !inst.rawData) continue;
                         var body = document.getElementById('body-' + clientId.replace(/[^a-zA-Z0-9]/g, '_'));
                         if (body && body.style.display === 'none') continue;
                         var devData = msg.devices[clientId];
@@ -1759,7 +1834,7 @@ HTML_PAGE = """
     }
 
     connectWebSocket();
-    console.log('📱 DeviceMonitor (性能优化版) 已启动');
+    console.log('📱 DeviceMonitor (自适应降采样, MAX_POINTS=' + MAX_POINTS + ') 已启动');
 </script>
 </body>
 </html>
@@ -1768,7 +1843,10 @@ HTML_PAGE = """
 
 def get_html():
     ws_port = CONFIG.get("ws_port", 91)
-    return HTML_PAGE.replace("{{WS_PORT}}", str(ws_port))
+    max_points = CONFIG.get("chart_max_points", 800)
+    html = HTML_PAGE.replace("{{WS_PORT}}", str(ws_port))
+    html = html.replace("{{MAX_POINTS}}", str(max_points))
+    return html
 
 
 async def web_handler(request):
@@ -1865,7 +1943,7 @@ async def main():
     host = CONFIG.get("host", "0.0.0.0")
 
     logger.info("=" * 80)
-    logger.info("📱 设备数据接收服务器 v17.0 (性能优化版)")
+    logger.info("📱 设备数据接收服务器 v18.1 (可配置降采样)")
     logger.info("=" * 80)
     logger.info(f"🌐 WebSocket: ws://{host}:{ws_port}")
     logger.info(f"🌐 Web界面: http://{host}:{web_port}")
@@ -1874,6 +1952,7 @@ async def main():
     logger.info("📝 全局配置: server_config.json")
     logger.info("📝 设备配置: device_data/<deviceId>/historySet.ini")
     logger.info(f"📦 数据模块: {', '.join(DATA_MODULES)}")
+    logger.info(f"📊 图表降采样目标点数: {CONFIG.get('chart_max_points', 800)}")
     logger.info("📄 静态资源: /static/echarts.min.js")
     logger.info("💡 在终端输入 .help 查看命令")
     logger.info("=" * 80)

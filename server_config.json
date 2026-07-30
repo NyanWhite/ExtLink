@@ -8,6 +8,7 @@
     "ping_timeout": 60,
     "save_history": true,
     "history_length": "1h",
+    "chart_max_points": 500,
     "data_modules": [
         "battery",
         "network",
