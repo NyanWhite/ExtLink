@@ -1,7 +1,7 @@
 ﻿# ws_server.py
 # 模块化存储 + 历史记录滑动窗口 + 可配置模块 + 多指标折线图（字段级智能单位转换 + 图表容器复用防重置）
-# 新增：基于电量变化率的剩余时间推算（优先使用硬盘历史数据，若 save_history 开启）
-#      取消时间上限截断，正常显示任意大小时间
+# 电池速率算法：双模式（历史极值+容量修正 / RAM段+即时两点+电流回退）
+# 亮度单位已修正，不再自动缩放
 
 import asyncio
 import json
@@ -133,8 +133,15 @@ class DeviceDataServer:
         # 历史记录缓存（用于精确去重）
         self.last_history_entry: Dict[str, Dict[str, Any]] = {}
 
-        # 电池历史缓存（用于计算变化率）: {device_id: [(timestamp_ms, level), ...]}
-        self.battery_history_cache: Dict[str, List[Tuple[int, int]]] = {}
+        # ----- 电池速率相关 -----
+        # 充电段与放电段（各保留最近一段连续数据）
+        self.battery_charge_segment: Dict[str, List[Tuple[int, int]]] = {}   # device_id -> [(timestamp_ms, level)]
+        self.battery_discharge_segment: Dict[str, List[Tuple[int, int]]] = {}
+        self.battery_last_charging: Dict[str, bool] = {}                     # 记录上次的充电状态
+
+        # 历史数据缓存（save_history=True 时从磁盘加载的极值信息）
+        self.battery_history_rates: Dict[str, Optional[Dict]] = {}           # device_id -> { 'rate', 'ref_capacity' }
+        self.history_loaded: Set[str] = set()
 
     async def start(self):
         if self.running:
@@ -235,6 +242,10 @@ class DeviceDataServer:
         self._ensure_device_dir(client_id)
         self.device_ini_cache[client_id] = self._load_device_ini(client_id)
 
+        # 如果 save_history 开启，尝试加载历史极值
+        if CONFIG.get('save_history', False):
+            self._load_battery_history_rates(client_id)
+
         try:
             await websocket.send(json.dumps({
                 "type": "welcome",
@@ -253,6 +264,10 @@ class DeviceDataServer:
             self.device_clients.pop(client_id, None)
             self.device_last_seen.pop(client_id, None)
             self.device_ini_cache.pop(client_id, None)
+            # 清理电池段
+            self.battery_charge_segment.pop(client_id, None)
+            self.battery_discharge_segment.pop(client_id, None)
+            self.battery_last_charging.pop(client_id, None)
 
     async def handle_web(self, websocket: websockets.WebSocketServerProtocol):
         self.web_clients.add(websocket)
@@ -291,6 +306,9 @@ class DeviceDataServer:
                 }
 
             self.save_data_to_file(client_id, data)
+
+            # 更新电池段
+            self._update_battery_segment(client_id, data)
 
             if data_type == 'full':
                 await self.handle_full_data(client_id, data)
@@ -424,24 +442,69 @@ class DeviceDataServer:
         self.last_history_entry.setdefault(client_id, {})[module] = current_data
         self._clean_history_file(history_file, max_seconds)
 
-    def _ensure_battery_cache_from_disk(self, client_id: str):
-        """
-        如果 save_history 为 True，尝试从磁盘加载电池历史数据填充缓存
-        """
-        if not CONFIG.get('save_history', False):
+    # ---------- 电池段管理 ----------
+    def _update_battery_segment(self, client_id: str, data: Dict):
+        """根据电池数据更新充电/放电段"""
+        battery = data.get('battery')
+        if not battery or not isinstance(battery, dict):
             return
-        # 如果已有缓存且非空，则不重复加载
-        if client_id in self.battery_history_cache and len(self.battery_history_cache[client_id]) >= 2:
+
+        level = battery.get('level')
+        if level is None or not (0 <= level <= 100):
+            return
+
+        charging = battery.get('charging', False)
+        timestamp = data.get('timestamp', int(time.time() * 1000))
+
+        # 初始化状态
+        if client_id not in self.battery_last_charging:
+            self.battery_last_charging[client_id] = charging
+            self.battery_charge_segment[client_id] = []
+            self.battery_discharge_segment[client_id] = []
+
+        last_charging = self.battery_last_charging[client_id]
+
+        # 如果充电状态变化，重置对应段
+        if charging != last_charging:
+            if charging:
+                # 切换到充电，清空充电段，放电段保留（但后续不再使用）
+                self.battery_charge_segment[client_id] = [(timestamp, level)]
+            else:
+                self.battery_discharge_segment[client_id] = [(timestamp, level)]
+            self.battery_last_charging[client_id] = charging
+        else:
+            # 状态相同，追加到对应段
+            if charging:
+                seg = self.battery_charge_segment.setdefault(client_id, [])
+                seg.append((timestamp, level))
+                # 只保留最近一段（最多100个点，防止内存泄漏）
+                if len(seg) > 100:
+                    seg = seg[-100:]
+                self.battery_charge_segment[client_id] = seg
+            else:
+                seg = self.battery_discharge_segment.setdefault(client_id, [])
+                seg.append((timestamp, level))
+                if len(seg) > 100:
+                    seg = seg[-100:]
+                self.battery_discharge_segment[client_id] = seg
+
+    # ---------- 电池速率计算 ----------
+    def _load_battery_history_rates(self, client_id: str):
+        """从磁盘历史文件中提取充放电极值，计算平均速率和参考容量（只执行一次）"""
+        if client_id in self.history_loaded:
             return
 
         history_file_gz = os.path.join(DATA_DIR, client_id, "hs", "battery.history.gz")
         history_file = os.path.join(DATA_DIR, client_id, "hs", "battery.history")
         if not os.path.exists(history_file_gz) and not os.path.exists(history_file):
+            logger.debug(f"历史文件不存在，无法加载电池速率 {client_id}")
+            self.history_loaded.add(client_id)
             return
 
         target_file = history_file_gz if os.path.exists(history_file_gz) else history_file
         open_func = gzip.open if target_file.endswith('.gz') else open
-        entries = []
+
+        entries = []   # (timestamp, level, capacity)
         try:
             with open_func(target_file, 'rt', encoding='utf-8') as f:
                 for line in f:
@@ -452,113 +515,167 @@ class DeviceDataServer:
                         entry = json.loads(line)
                         ts = entry.get('timestamp')
                         data = entry.get('data')
-                        if ts is not None and data is not None and isinstance(data, dict):
+                        if ts is not None and data and isinstance(data, dict):
                             level = data.get('level')
+                            cap = data.get('capacity')  # 可能不存在
                             if level is not None and 0 <= level <= 100:
-                                entries.append((ts, level))
+                                entries.append((ts, level, cap))
                     except:
                         continue
         except Exception as e:
             logger.error(f"加载电池历史文件失败 {target_file}: {e}")
+            self.history_loaded.add(client_id)
             return
 
-        if not entries:
+        if len(entries) < 2:
+            logger.debug(f"历史数据不足，无法计算速率 {client_id}")
+            self.history_loaded.add(client_id)
             return
+
         # 按时间排序
         entries.sort(key=lambda x: x[0])
-        # 取最近最多30条
-        if len(entries) > 30:
-            entries = entries[-30:]
-        self.battery_history_cache[client_id] = entries
-        logger.debug(f"从磁盘加载电池历史 {client_id}: {len(entries)} 条记录")
 
-    def save_data_to_file(self, client_id: str, data: Dict[str, Any]):
-        try:
-            # 根据充电状态反转电池电流符号
-            if 'battery' in data and isinstance(data['battery'], dict):
-                if 'current' in data['battery']:
-                    cur = data['battery']['current']
-                    if isinstance(cur, (int, float)):
-                        charging = data['battery'].get('charging', False)
-                        if charging:
-                            data['battery']['current'] = abs(cur)
-                        else:
-                            data['battery']['current'] = -abs(cur)
+        # 找出最大和最小电量及其对应信息
+        max_entry = max(entries, key=lambda x: x[1])
+        min_entry = min(entries, key=lambda x: x[1])
 
-                # ---- 更新电池历史缓存（用于变化率） ----
-                battery = data['battery']
-                level = battery.get('level')
-                if level is not None and level >= 0 and level <= 100:
-                    timestamp = data.get('timestamp', int(time.time() * 1000))
-                    cache = self.battery_history_cache.setdefault(client_id, [])
-                    cache.append((timestamp, level))
-                    # 仅保留最近30条
-                    if len(cache) > 30:
-                        cache = cache[-30:]
-                    self.battery_history_cache[client_id] = cache
+        max_level = max_entry[1]
+        min_level = min_entry[1]
+        delta_level = max_level - min_level
+        if delta_level < 5:   # 变化太小，无意义
+            logger.debug(f"历史电量变化过小 ({delta_level}%)，忽略")
+            self.history_loaded.add(client_id)
+            return
 
-            device_dir = self._ensure_device_dir(client_id)
+        ts_max = max_entry[0]
+        ts_min = min_entry[0]
+        delta_ms = abs(ts_max - ts_min)
+        if delta_ms < 60000:  # 少于一分钟，不稳定
+            logger.debug(f"历史时间跨度过短 ({delta_ms/1000}s)，忽略")
+            self.history_loaded.add(client_id)
+            return
 
-            if 'device' in data:
-                device_file = os.path.join(device_dir, "device_info.json")
-                with open(device_file, 'w', encoding='utf-8') as f:
-                    json.dump(data['device'], f, indent=2, ensure_ascii=False)
+        # 计算平均速率（% / 分钟）
+        rate = delta_level / (delta_ms / 60000.0)
+        # 取符号（如果最大电量在时间上在后，则为充电；否则放电）
+        if ts_max > ts_min:
+            rate = abs(rate)      # 充电
+        else:
+            rate = -abs(rate)     # 放电
 
-            timestamp = data.get('timestamp', int(time.time() * 1000))
+        # 计算参考容量（两个极值的平均）
+        cap_max = max_entry[2]
+        cap_min = min_entry[2]
+        ref_capacity = None
+        if cap_max is not None and cap_min is not None:
+            ref_capacity = (cap_max + cap_min) / 2
+        elif cap_max is not None:
+            ref_capacity = cap_max
+        elif cap_min is not None:
+            ref_capacity = cap_min
 
-            for module in DATA_MODULES:
-                if module in data and data[module] is not None:
-                    module_file = os.path.join(device_dir, f"{module}.json")
-                    with open(module_file, 'w', encoding='utf-8') as f:
-                        json.dump(data[module], f, indent=2, ensure_ascii=False)
+        self.battery_history_rates[client_id] = {
+            'rate': rate,
+            'ref_capacity': ref_capacity
+        }
+        self.history_loaded.add(client_id)
+        logger.info(f"✅ 从历史加载电池速率 {client_id}: {rate:.2f}%/min (参考容量 {ref_capacity})")
 
-                    save_flag, _ = self._get_module_history_settings(client_id, module)
-                    if save_flag:
-                        entry = {
-                            "timestamp": timestamp,
-                            "data": data[module]
-                        }
-                        self._save_history_entry(client_id, module, entry)
-
-            timestamp_file = os.path.join(device_dir, "last_update.json")
-            with open(timestamp_file, 'w', encoding='utf-8') as f:
-                json.dump({
-                    "last_update": datetime.now().isoformat(),
-                    "timestamp": timestamp
-                }, f, indent=2, ensure_ascii=False)
-
-        except Exception as e:
-            logger.error(f"❌ 保存数据失败 (设备 {client_id}): {e}")
+    def _get_current_battery_data(self, client_id: str) -> Dict:
+        """获取当前设备的最新电池数据"""
+        data = self.device_data.get(client_id, {})
+        return data.get('battery', {})
 
     def _calculate_battery_rate(self, client_id: str) -> Optional[float]:
         """
-        基于历史缓存计算每分钟电量变化率（% / 分钟）
-        返回正数表示充电（上升），负数表示放电（下降）
-        若数据不足或无效，返回 None
+        计算电量变化率（%/分钟），正数充电，负数放电，None 表示无法计算
+        策略：
+        1. 如果 save_history 开启且历史极值可用，使用历史速率并考虑当前容量修正。
+        2. 否则，使用 RAM 段：
+           a. 若段内首尾变化 >=10% 且时间足够，用首尾平均速率。
+           b. 否则，若最近两点时间足够，用两点瞬时速率。
+           c. 否则，回退到瞬时电流估算。
         """
-        # 如果 save_history 开启，尝试从磁盘加载历史数据
+        # 1) 历史模式 (save_history=True)
         if CONFIG.get('save_history', False):
-            self._ensure_battery_cache_from_disk(client_id)
+            if client_id not in self.history_loaded:
+                self._load_battery_history_rates(client_id)
+            hist = self.battery_history_rates.get(client_id)
+            if hist:
+                rate = hist['rate']
+                ref_cap = hist.get('ref_capacity')
+                if ref_cap is not None:
+                    # 获取当前容量
+                    battery = self._get_current_battery_data(client_id)
+                    cur_cap = battery.get('capacity')
+                    if cur_cap is not None and cur_cap > 0:
+                        # 修正速率：容量变小，速率加快（百分比变化更快）
+                        adjusted = rate * (ref_cap / cur_cap)
+                        # 限幅
+                        if abs(adjusted) > 50:
+                            adjusted = 50 if adjusted > 0 else -50
+                        return adjusted
+                # 无容量修正或ref_cap缺失，直接返回
+                return rate
 
-        cache = self.battery_history_cache.get(client_id)
-        if not cache or len(cache) < 2:
+        # 2) RAM 段模式 (save_history=False 或历史不可用)
+        # 获取当前充电状态对应的段
+        last_charging = self.battery_last_charging.get(client_id)
+        if last_charging is True:
+            seg = self.battery_charge_segment.get(client_id, [])
+        elif last_charging is False:
+            seg = self.battery_discharge_segment.get(client_id, [])
+        else:
+            seg = []   # 未知状态，尝试用任意长度>=2的段
+            if len(self.battery_charge_segment.get(client_id, [])) >= 2:
+                seg = self.battery_charge_segment[client_id]
+            elif len(self.battery_discharge_segment.get(client_id, [])) >= 2:
+                seg = self.battery_discharge_segment[client_id]
+
+        if len(seg) >= 2:
+            # a) 首尾变化 >=10% 且时间跨度 >=30秒
+            first_ts, first_level = seg[0]
+            last_ts, last_level = seg[-1]
+            delta_level = last_level - first_level
+            delta_ms = last_ts - first_ts
+            if abs(delta_level) >= 10 and delta_ms >= 30000:
+                rate = delta_level / (delta_ms / 60000.0)
+                if abs(rate) > 50:
+                    rate = 50 if rate > 0 else -50
+                return rate
+
+            # b) 使用最近两点（即时估算）
+            if len(seg) >= 2:
+                prev_ts, prev_level = seg[-2]
+                curr_ts, curr_level = seg[-1]
+                delta_ms2 = curr_ts - prev_ts
+                if delta_ms2 >= 10000:  # 至少10秒
+                    rate2 = (curr_level - prev_level) / (delta_ms2 / 60000.0)
+                    if abs(rate2) > 50:
+                        rate2 = 50 if rate2 > 0 else -50
+                    return rate2
+
+        # c) 回退到瞬时电流估算
+        return self._calculate_rate_from_current(client_id)
+
+    def _calculate_rate_from_current(self, client_id: str) -> Optional[float]:
+        """使用瞬时电流和容量估算速率（回退方案）"""
+        battery = self._get_current_battery_data(client_id)
+        current = battery.get('current')      # 微安
+        capacity = battery.get('capacity')    # 微安时
+        if current is None or capacity is None or capacity <= 0:
             return None
+        current_ma = abs(current) / 1000.0
+        capacity_mah = capacity / 1000.0
+        # 每小时变化百分比 = (电流/容量)*100
+        percent_per_hour = (current_ma / capacity_mah) * 100
+        percent_per_min = percent_per_hour / 60.0
+        if battery.get('charging', False):
+            return percent_per_min
+        else:
+            return -percent_per_min
 
-        # 只取最近的数据点，但确保时间跨度至少30秒，避免噪声
-        # 取最早和最晚两点计算平均速率
-        first_ts, first_level = cache[0]
-        last_ts, last_level = cache[-1]
-        delta_ms = last_ts - first_ts
-        if delta_ms < 30000:  # 少于30秒，数据太密集，可能不稳定
-            return None
-        delta_min = delta_ms / 60000.0  # 转换为分钟
-        delta_level = last_level - first_level
-        rate = delta_level / delta_min
-        # 限制变化率绝对值最大为 50% / 分钟（防止突变）
-        if abs(rate) > 50:
-            rate = 50 if rate > 0 else -50
-        return rate
-
+    # ---------- 其他 ----------
     def get_device_stats(self) -> Dict[str, Any]:
         now = time.time()
         stats = {
@@ -574,7 +691,6 @@ class DeviceDataServer:
             data_timestamp = data.get('timestamp', 0)
             network = data.get('network', {})
 
-            # 计算电池变化率
             battery_rate = self._calculate_battery_rate(client_id)
 
             stats["devices"][client_id] = {
@@ -592,7 +708,7 @@ class DeviceDataServer:
                 "screen_width": info.get('screen_width', 1080),
                 "screen_height": info.get('screen_height', 2400),
                 "first_seen": info.get('first_seen', 'Unknown'),
-                "battery_rate": battery_rate,  # 新增字段
+                "battery_rate": battery_rate,
                 "network": {
                     "type": network.get('type', '未知'),
                     "detail": network.get('detail', ''),
@@ -954,6 +1070,10 @@ HTML_PAGE = """
         if (module === 'network' && (field === 'downSpeed' || field === 'upSpeed')) {
             return { data: raw, unit: '' };
         }
+        // 修正：screen 模块的 brightness 不进行缩放
+        if (module === 'screen' && field === 'brightness') {
+            return { data: raw, unit: '' };
+        }
         return autoScaleByValue(raw);
     }
 
@@ -1296,9 +1416,8 @@ HTML_PAGE = """
 
             // ---- 电池剩余时间推算 ----
             var batterySub = battery.charging ? '⚡ 充电中' : '🔌 未充电';
-            var batteryRate = dev.battery_rate; // 来自服务器，单位 %/分钟，正=充电，负=放电
+            var batteryRate = dev.battery_rate;
 
-            // 优先使用基于变化率的算法
             if (batteryRate !== undefined && batteryRate !== null && batteryRate !== 0 &&
                 batteryLevel !== '?' && batteryLevel >= 0 && batteryLevel <= 100) {
                 
@@ -1313,7 +1432,6 @@ HTML_PAGE = """
                 var remainingSeconds = remainingMinutes * 60;
 
                 if (isFinite(remainingSeconds) && remainingSeconds > 0) {
-                    // 不再限制最大值，直接显示
                     var endTime = new Date(Date.now() + remainingSeconds * 1000);
                     var timeStr = formatDuration(remainingSeconds);
                     var timePointStr = endTime.toTimeString().slice(0, 8);
@@ -1369,7 +1487,7 @@ HTML_PAGE = """
 
             var screen = dev.screen || {};
             var screenStatus = screen.isOn ? '🟢 亮屏' : '🔴 熄屏';
-            var brightness = screen.brightness || '?';
+            var brightness = screen.brightness !== undefined ? screen.brightness : '?';
 
             var location = dev.location || {};
             var hasLocation = location.hasLocation || false;
@@ -1718,7 +1836,7 @@ async def main():
     host = CONFIG.get("host", "0.0.0.0")
 
     logger.info("=" * 80)
-    logger.info("📱 设备数据接收服务器 v15.3 (智能单位转换 + 电量变化率推算)")
+    logger.info("📱 设备数据接收服务器 v16.1 (双模式电池速率推算 + 亮度修正)")
     logger.info("=" * 80)
     logger.info(f"🌐 WebSocket: ws://{host}:{ws_port}")
     logger.info(f"🌐 Web界面: http://{host}:{web_port}")
