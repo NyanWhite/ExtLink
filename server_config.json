@@ -6,16 +6,19 @@
     "log_level": 0,
     "ping_interval": 30,
     "ping_timeout": 60,
-    "save_history": true,
-    "history_length": "1h",
-    "chart_max_points": 500,
+    "save_history": false,
+    "history_length": "7d",
     "data_modules": [
         "battery",
         "network",
+        "foreground",
         "screen",
         "sensors",
         "location",
         "memory",
         "storage"
-    ]
+    ],
+    "chart_max_points": 800,
+    "capacity_stability_threshold": 0.1,
+    "capacity_outlier_std_multiplier": 3.0
 }
