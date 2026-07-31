@@ -1,10 +1,7 @@
 # ws_server.py
-# 模块化存储 + 历史记录滑动窗口 + 可配置模块 + 多指标折线图（字段级智能单位转换 + 图表容器复用防重置）
-# 电池速率算法：双模式（历史极值+容量修正 / RAM段+即时两点+电流回退）
-# 亮度单位已修正，不再自动缩放
-# 性能优化：折叠卡片销毁图表、防抖渲染、增量更新检查展开状态
-# 自适应降采样（LTTB），目标点数可通过 server_config.json 的 chart_max_points 配置
-# 容量修正增强：从历史充电数据中提取稳定满充容量作为参考基准（消除异常值干扰）
+# 模块化存储 + 历史记录滑动窗口 + 可配置模块 + 多指标折线图
+# 电池速率算法：支持 capacity / voltage / level / all 多种测算模式
+# 配置项：calculate_battery_method, calculate_battery_threshold, calculate_battery_outlier_std_multiplier
 
 import asyncio
 import json
@@ -19,6 +16,7 @@ from typing import Dict, Any, Optional, Set, List, Tuple
 import websockets
 from aiohttp import web
 import statistics
+from collections import Counter
 
 # 配置日志
 logging.basicConfig(
@@ -51,8 +49,9 @@ DEFAULT_CONFIG = {
         "storage"
     ],
     "chart_max_points": 800,
-    "capacity_stability_threshold": 0.1,
-    "capacity_outlier_std_multiplier": 3.0
+    "calculate_battery_threshold": 0.1,
+    "calculate_battery_outlier_std_multiplier": 3.0,
+    "calculate_battery_method": "level"
 }
 
 
@@ -147,6 +146,9 @@ class DeviceDataServer:
 
         self.battery_history_rates: Dict[str, Optional[Dict]] = {}
         self.history_loaded: Set[str] = set()
+
+        # 用于 capacity/voltage 模式的最新两点数据
+        self.battery_readings: Dict[str, List[Dict]] = {}  # 每个设备保存最近2条记录
 
     async def start(self):
         if self.running:
@@ -270,6 +272,7 @@ class DeviceDataServer:
             self.battery_charge_segment.pop(client_id, None)
             self.battery_discharge_segment.pop(client_id, None)
             self.battery_last_charging.pop(client_id, None)
+            self.battery_readings.pop(client_id, None)
 
     async def handle_web(self, websocket: websockets.WebSocketServerProtocol):
         self.web_clients.add(websocket)
@@ -305,6 +308,19 @@ class DeviceDataServer:
 
             self.save_data_to_file(client_id, data)
             self._update_battery_segment(client_id, data)
+
+            # 更新电池读数缓存（用于 capacity/voltage 模式）
+            battery = data.get('battery')
+            if battery and isinstance(battery, dict):
+                cap = battery.get('capacity')
+                volt = battery.get('voltage')
+                ts = data.get('timestamp', int(time.time() * 1000))
+                if cap is not None or volt is not None:
+                    # 保留最近2个读数
+                    readings = self.battery_readings.setdefault(client_id, [])
+                    readings.append({'timestamp': ts, 'capacity': cap, 'voltage': volt})
+                    if len(readings) > 2:
+                        readings.pop(0)
 
             if data_type == 'full':
                 await self.handle_full_data(client_id, data)
@@ -523,140 +539,114 @@ class DeviceDataServer:
                     seg = seg[-100:]
                 self.battery_discharge_segment[client_id] = seg
 
-    # ========== 容量修正增强：稳定段提取 ==========
+    # ========== 容量/电压 稳定段提取（通用） ==========
     @staticmethod
-    def _extract_stable_capacity(entries: List[Tuple[int, int, Optional[int]]],
-                                 stability_threshold: float,
-                                 outlier_std_multiplier: float) -> Tuple[Optional[float], Optional[int]]:
+    def _extract_stable_value(entries: List[Tuple[int, int, Optional[float]]],
+                              value_key: str,  # 'capacity' or 'voltage'
+                              stability_threshold: float,
+                              outlier_std_multiplier: float) -> Tuple[Optional[float], Optional[float]]:
         """
-        从历史充电数据中提取稳定容量值和最小容量值
-
+        从历史充电数据中提取稳定最大值和最小值
         参数:
-            entries: [(timestamp, level, capacity), ...]
-            stability_threshold: 波动容忍度（百分比），例如 0.1 表示 ±0.1%
-            outlier_std_multiplier: 标准差倍数，用于过滤异常值
-
-        返回:
-            (stable_cap_max, cap_min) 或 (None, None)
+            entries: [(timestamp, level, value), ...]  (value 对应 capacity 或 voltage)
+            返回: (stable_max, min_val) 或 (None, None)
         """
         if len(entries) < 10:
-            logger.debug(f"历史数据过少 ({len(entries)}条)，无法提取稳定容量")
             return None, None
 
-        # 只保留充电状态的数据 (charging 信息在调用时已过滤)
+        # 提取所有有效值
+        values = [v for _, _, v in entries if v is not None and v > 0]
+        if len(values) < 5:
+            return None, None
+
         # 按时间排序
         sorted_entries = sorted(entries, key=lambda x: x[0])
 
-        # 分段：检测充电连续性（如果两条记录时间间隔 > 60秒，视为新的段）
+        # 分段：检测充电连续性（间隔 > 60秒 视为新段）
         segments = []
         current_seg = []
         last_ts = None
-
-        for ts, level, cap in sorted_entries:
-            if cap is None or cap <= 0:
+        for ts, level, val in sorted_entries:
+            if val is None or val <= 0:
                 continue
-            if last_ts is not None and (ts - last_ts) > 60000:  # 超过60秒断开视为新段
+            if last_ts is not None and (ts - last_ts) > 60000:
                 if len(current_seg) >= 3:
                     segments.append(current_seg)
                 current_seg = []
-            current_seg.append((ts, level, cap))
+            current_seg.append(val)
             last_ts = ts
-
         if len(current_seg) >= 3:
             segments.append(current_seg)
 
         if not segments:
-            logger.debug(f"无有效充电段")
             return None, None
 
         stable_segments = []
-
         for seg in segments:
             if len(seg) < 3:
                 continue
 
-            caps = [x[2] for x in seg]
-            median = statistics.median(caps)
-
             # 用中位数 ± N*标准差 过滤异常值
-            if len(caps) >= 4:
+            median = statistics.median(seg)
+            if len(seg) >= 4:
                 try:
-                    std_dev = statistics.stdev(caps)
+                    std_dev = statistics.stdev(seg)
                 except statistics.StatisticsError:
                     std_dev = 0
-
                 if std_dev > 0:
                     lower = median - outlier_std_multiplier * std_dev
                     upper = median + outlier_std_multiplier * std_dev
-                    filtered_caps = [c for c in caps if lower <= c <= upper]
+                    filtered = [v for v in seg if lower <= v <= upper]
                 else:
-                    filtered_caps = caps
+                    filtered = seg
             else:
-                filtered_caps = caps
+                filtered = seg
 
-            if len(filtered_caps) < 3:
+            if len(filtered) < 3:
                 continue
 
-            # 计算波动百分比
-            cap_mean = statistics.mean(filtered_caps)
-            cap_min = min(filtered_caps)
-            cap_max = max(filtered_caps)
-            if cap_mean == 0:
-                continue
-            fluctuation = (cap_max - cap_min) / cap_mean * 100  # 百分比
+            mean_val = statistics.mean(filtered)
+            min_val = min(filtered)
+            max_val = max(filtered)
+            fluctuation = (max_val - min_val) / mean_val * 100 if mean_val else 0
 
             if fluctuation <= stability_threshold:
-                stable_segments.append(cap_mean)
-                logger.debug(f"✅ 稳定段: 容量={cap_mean:.0f}, 波动={fluctuation:.3f}%, 点数={len(filtered_caps)}")
+                stable_segments.append(mean_val)
 
         if not stable_segments:
-            logger.debug(f"无稳定段（所有段波动 > {stability_threshold}%）")
             return None, None
 
-        # 取众数（出现频率最高的稳定容量）
-        from collections import Counter
+        # 取众数（或平均）
         counter = Counter(stable_segments)
-        most_common_val, count = counter.most_common(1)[0]
-
-        # 如果唯一值太少，取平均
+        most_common, count = counter.most_common(1)[0]
         if len(counter) <= 2:
-            logger.debug(f"稳定段唯一值较少 ({len(counter)}种)，取平均值")
-            stable_cap_max = statistics.mean(stable_segments)
+            stable_max = statistics.mean(stable_segments)
         else:
-            stable_cap_max = most_common_val
-            logger.debug(f"取众数: {stable_cap_max:.0f} (出现 {count} 次)")
+            stable_max = most_common
 
-        # 最小值：从所有充电数据中取最小（已过滤掉异常低值）
-        all_caps = [x[2] for x in sorted_entries if x[2] is not None and x[2] > 0]
-        if all_caps:
-            # 用同样的统计方法过滤异常低值
-            median_all = statistics.median(all_caps)
-            if len(all_caps) >= 4:
-                try:
-                    std_all = statistics.stdev(all_caps)
-                except statistics.StatisticsError:
-                    std_all = 0
-                if std_all > 0:
-                    lower = median_all - outlier_std_multiplier * std_all
-                    # 只过滤低端异常值（太低的值可能是测量误差）
-                    filtered_all = [c for c in all_caps if c >= lower]
-                else:
-                    filtered_all = all_caps
+        # 最小值：用相同方法过滤异常低值
+        all_vals = values
+        median_all = statistics.median(all_vals)
+        if len(all_vals) >= 4:
+            try:
+                std_all = statistics.stdev(all_vals)
+            except statistics.StatisticsError:
+                std_all = 0
+            if std_all > 0:
+                lower = median_all - outlier_std_multiplier * std_all
+                filtered_all = [v for v in all_vals if v >= lower]
             else:
-                filtered_all = all_caps
-
-            if filtered_all:
-                cap_min = min(filtered_all)
-            else:
-                cap_min = min(all_caps)
+                filtered_all = all_vals
         else:
-            cap_min = None
+            filtered_all = all_vals
 
-        return stable_cap_max, cap_min
+        min_val = min(filtered_all) if filtered_all else min(all_vals)
+
+        return stable_max, min_val
 
     # ---------- 电池速率计算 ----------
     def _load_battery_history_rates(self, client_id: str):
-        """从历史数据中加载并计算电池速率参考值（容量修正增强版）"""
+        """从历史数据中加载并计算电池速率参考值（用于各种模式）"""
         if client_id in self.history_loaded:
             return
 
@@ -670,8 +660,7 @@ class DeviceDataServer:
         target_file = history_file_gz if os.path.exists(history_file_gz) else history_file
         open_func = gzip.open if target_file.endswith('.gz') else open
 
-        # 读取所有历史记录
-        entries = []
+        entries = []  # (timestamp, level, capacity, voltage, charging)
         try:
             with open_func(target_file, 'rt', encoding='utf-8') as f:
                 for line in f:
@@ -685,9 +674,10 @@ class DeviceDataServer:
                         if ts is not None and data and isinstance(data, dict):
                             level = data.get('level')
                             cap = data.get('capacity')
+                            volt = data.get('voltage')
                             charging = data.get('charging', False)
                             if level is not None and 0 <= level <= 100:
-                                entries.append((ts, level, cap, charging))
+                                entries.append((ts, level, cap, volt, charging))
                     except:
                         continue
         except Exception as e:
@@ -703,103 +693,82 @@ class DeviceDataServer:
         # 按时间排序
         entries.sort(key=lambda x: x[0])
 
-        # ---- 计算速率（使用历史极值） ----
-        # 取电量的最大和最小值
+        # ---- 计算 level 历史速率（用于 level 模式） ----
         max_entry = max(entries, key=lambda x: x[1])
         min_entry = min(entries, key=lambda x: x[1])
 
         max_level = max_entry[1]
         min_level = min_entry[1]
         delta_level = max_level - min_level
-        if delta_level < 5:
-            logger.debug(f"历史电量变化过小 ({delta_level}%)，忽略")
-            self.history_loaded.add(client_id)
-            return
-
-        ts_max = max_entry[0]
-        ts_min = min_entry[0]
-        delta_ms = abs(ts_max - ts_min)
-        if delta_ms < 60000:
-            logger.debug(f"历史时间跨度过短 ({delta_ms/1000}s)，忽略")
-            self.history_loaded.add(client_id)
-            return
-
-        # 计算历史速率（%/min）
-        rate = delta_level / (delta_ms / 60000.0)
-        if ts_max > ts_min:
-            rate = abs(rate)
+        if delta_level >= 5:
+            ts_max = max_entry[0]
+            ts_min = min_entry[0]
+            delta_ms = abs(ts_max - ts_min)
+            if delta_ms >= 60000:
+                rate = delta_level / (delta_ms / 60000.0)
+                if ts_max > ts_min:
+                    rate = abs(rate)
+                else:
+                    rate = -abs(rate)
+            else:
+                rate = None
         else:
-            rate = -abs(rate)
+            rate = None
 
-        # ---- 容量修正：提取稳定满充容量和最小容量 ----
-        # 只取充电状态的数据用于容量基准提取
-        charging_entries = [(ts, level, cap) for ts, level, cap, chg in entries if chg and cap is not None and cap > 0]
+        # ---- 提取充电状态下的容量和电压稳定值 ----
+        charging_entries = [(ts, level, cap) for ts, level, cap, volt, chg in entries if chg and cap is not None and cap > 0]
+        charging_volt_entries = [(ts, level, volt) for ts, level, cap, volt, chg in entries if chg and volt is not None and volt > 0]
 
-        if len(charging_entries) < 5:
-            logger.debug(f"充电数据不足（{len(charging_entries)}条），无法提取稳定容量，使用无修正速率")
-            self.battery_history_rates[client_id] = {
-                'rate': rate,
-                'ref_capacity': None
-            }
-            self.history_loaded.add(client_id)
-            return
+        stability_threshold = CONFIG.get('calculate_battery_threshold', 0.1)
+        outlier_multiplier = CONFIG.get('calculate_battery_outlier_std_multiplier', 3.0)
 
-        stability_threshold = CONFIG.get('capacity_stability_threshold', 0.1)
-        outlier_std_multiplier = CONFIG.get('capacity_outlier_std_multiplier', 3.0)
-
-        stable_cap_max, cap_min = self._extract_stable_capacity(
-            charging_entries,
-            stability_threshold,
-            outlier_std_multiplier
+        cap_stable, cap_min = self._extract_stable_value(
+            charging_entries, 'capacity', stability_threshold, outlier_multiplier
+        )
+        volt_stable, volt_min = self._extract_stable_value(
+            charging_volt_entries, 'voltage', stability_threshold, outlier_multiplier
         )
 
-        if stable_cap_max is None or stable_cap_max <= 0:
-            logger.debug(f"无法提取稳定容量，使用无修正速率")
-            self.battery_history_rates[client_id] = {
-                'rate': rate,
-                'ref_capacity': None
-            }
-            self.history_loaded.add(client_id)
-            return
-
-        # 存储结果：参考容量 = 稳定满充容量（不取平均）
+        # 存储
         self.battery_history_rates[client_id] = {
-            'rate': rate,
-            'ref_capacity': stable_cap_max,
-            'cap_min': cap_min
+            'level_rate': rate,           # 历史 level 速率（可能为 None）
+            'cap_stable': cap_stable,
+            'cap_min': cap_min,
+            'volt_stable': volt_stable,
+            'volt_min': volt_min,
         }
 
         self.history_loaded.add(client_id)
         logger.info(
-            f"✅ 从历史加载电池速率 {client_id}: {rate:.2f}%/min, "
-            f"稳定容量={stable_cap_max:.0f}, 最小容量={cap_min if cap_min else 'N/A'}"
+            f"✅ 从历史加载电池数据 {client_id}: "
+            f"level_rate={rate if rate is not None else 'N/A'}, "
+            f"cap_stable={cap_stable if cap_stable else 'N/A'}, "
+            f"cap_min={cap_min if cap_min else 'N/A'}, "
+            f"volt_stable={volt_stable if volt_stable else 'N/A'}, "
+            f"volt_min={volt_min if volt_min else 'N/A'}"
         )
 
-    def _get_current_battery_data(self, client_id: str) -> Dict:
-        data = self.device_data.get(client_id, {})
-        return data.get('battery', {})
-
-    def _calculate_battery_rate(self, client_id: str) -> Optional[float]:
+    # ---------- 各模式速率计算 ----------
+    def _calculate_battery_rate_level(self, client_id: str) -> Optional[float]:
+        """原有 level 模式复合算法（历史极值 + RAM段 + 电流回退）"""
         # 1) 历史模式（容量修正）
         if CONFIG.get('save_history', False):
-            if client_id not in self.history_loaded:
-                self._load_battery_history_rates(client_id)
             hist = self.battery_history_rates.get(client_id)
-            if hist:
-                rate = hist['rate']
-                ref_cap = hist.get('ref_capacity')
+            if hist and hist.get('level_rate') is not None:
+                rate = hist['level_rate']
+                # 容量修正（如果可用）
+                ref_cap = hist.get('cap_stable')
                 if ref_cap is not None and ref_cap > 0:
                     battery = self._get_current_battery_data(client_id)
                     cur_cap = battery.get('capacity')
                     if cur_cap is not None and cur_cap > 0:
-                        # 使用稳定满充容量作为参考基准
                         adjusted = rate * (ref_cap / cur_cap)
                         if abs(adjusted) > 50:
                             adjusted = 50 if adjusted > 0 else -50
                         return adjusted
                 return rate
 
-        # 2) RAM段模式（已移除 10% 和 30秒 限制）
+        # 2) RAM段模式
         last_charging = self.battery_last_charging.get(client_id)
         if last_charging is True:
             seg = self.battery_charge_segment.get(client_id, [])
@@ -812,7 +781,6 @@ class DeviceDataServer:
             elif len(self.battery_discharge_segment.get(client_id, [])) >= 2:
                 seg = self.battery_discharge_segment[client_id]
 
-        # 只要有 >=2 个点就直接算斜率（不再限制最小变化量和时间跨度）
         if len(seg) >= 2:
             first_ts, first_level = seg[0]
             last_ts, last_level = seg[-1]
@@ -824,7 +792,6 @@ class DeviceDataServer:
                     rate = 50 if rate > 0 else -50
                 return rate
 
-            # 最近两点（同样取消限制）
             if len(seg) >= 2:
                 prev_ts, prev_level = seg[-2]
                 curr_ts, curr_level = seg[-1]
@@ -853,6 +820,100 @@ class DeviceDataServer:
         else:
             return -percent_per_min
 
+    def _calculate_rate_capacity(self, client_id: str) -> Optional[float]:
+        """基于容量变化率（μAh/min）除以容量范围得到 %/min"""
+        hist = self.battery_history_rates.get(client_id)
+        if not hist:
+            return None
+        cap_stable = hist.get('cap_stable')
+        cap_min = hist.get('cap_min')
+        if cap_stable is None or cap_min is None or cap_stable <= cap_min:
+            return None
+
+        readings = self.battery_readings.get(client_id, [])
+        if len(readings) < 2:
+            return None
+        last = readings[-1]
+        prev = readings[-2]
+        if last['timestamp'] == prev['timestamp'] or last['capacity'] is None or prev['capacity'] is None:
+            return None
+        dt_ms = last['timestamp'] - prev['timestamp']
+        if dt_ms <= 0:
+            return None
+        dcap = last['capacity'] - prev['capacity']
+        if dcap == 0:
+            return 0.0
+
+        cap_rate_per_min = dcap / (dt_ms / 60000.0)
+        range_cap = cap_stable - cap_min
+        if range_cap <= 0:
+            return None
+        percent_per_min = (cap_rate_per_min / range_cap) * 100
+        if abs(percent_per_min) > 50:
+            percent_per_min = 50 if percent_per_min > 0 else -50
+        return percent_per_min
+
+    def _calculate_rate_voltage(self, client_id: str) -> Optional[float]:
+        """基于电压变化率（mV/min）除以电压范围得到 %/min"""
+        hist = self.battery_history_rates.get(client_id)
+        if not hist:
+            return None
+        volt_stable = hist.get('volt_stable')
+        volt_min = hist.get('volt_min')
+        if volt_stable is None or volt_min is None or volt_stable <= volt_min:
+            return None
+
+        readings = self.battery_readings.get(client_id, [])
+        if len(readings) < 2:
+            return None
+        last = readings[-1]
+        prev = readings[-2]
+        if last['timestamp'] == prev['timestamp'] or last['voltage'] is None or prev['voltage'] is None:
+            return None
+        dt_ms = last['timestamp'] - prev['timestamp']
+        if dt_ms <= 0:
+            return None
+        dvolt = last['voltage'] - prev['voltage']
+        if dvolt == 0:
+            return 0.0
+
+        volt_rate_per_min = dvolt / (dt_ms / 60000.0)
+        range_volt = volt_stable - volt_min
+        if range_volt <= 0:
+            return None
+        percent_per_min = (volt_rate_per_min / range_volt) * 100
+        if abs(percent_per_min) > 50:
+            percent_per_min = 50 if percent_per_min > 0 else -50
+        return percent_per_min
+
+    def _get_current_battery_data(self, client_id: str) -> Dict:
+        data = self.device_data.get(client_id, {})
+        return data.get('battery', {})
+
+    def _calculate_battery_rate(self, client_id: str) -> Optional[float]:
+        """根据配置的模式计算电池速率"""
+        method = CONFIG.get('calculate_battery_method', 'level')
+        if method == 'level':
+            return self._calculate_battery_rate_level(client_id)
+        elif method == 'capacity':
+            return self._calculate_rate_capacity(client_id)
+        elif method == 'voltage':
+            return self._calculate_rate_voltage(client_id)
+        elif method == 'all':
+            rates = []
+            r1 = self._calculate_battery_rate_level(client_id)
+            r2 = self._calculate_rate_capacity(client_id)
+            r3 = self._calculate_rate_voltage(client_id)
+            for r in (r1, r2, r3):
+                if r is not None:
+                    rates.append(r)
+            if rates:
+                return sum(rates) / len(rates)
+            else:
+                return None
+        else:
+            return self._calculate_battery_rate_level(client_id)
+
     # ---------- 统计 ----------
     def get_device_stats(self) -> Dict[str, Any]:
         now = time.time()
@@ -860,7 +921,8 @@ class DeviceDataServer:
             "total_clients": len(self.device_clients),
             "active_devices": len([c for c, t in self.device_last_seen.items() if now - t < 300]),
             "total_messages": self.total_messages,
-            "devices": {}
+            "devices": {},
+            "battery_calc_mode": CONFIG.get('calculate_battery_method', 'level')
         }
 
         for client_id, data in self.device_data.items():
@@ -1197,12 +1259,10 @@ HTML_PAGE = """
     var chartInstances = {};
     var renderTimer = null;
 
-    // 降采样目标点数（从服务器配置注入）
     var MAX_POINTS = {{MAX_POINTS}};
 
-    // ==================== LTTB 降采样算法 ====================
+    // ==================== LTTB 降采样 ====================
     function lttb(data, threshold) {
-        // data: array of [x, y] pairs, threshold: desired number of output points
         if (threshold >= data.length) return data.slice();
         if (threshold < 2) return [data[0], data[data.length-1]];
 
@@ -1268,7 +1328,6 @@ HTML_PAGE = """
             var points = timestamps.map(function(ts, idx) {
                 return [ts, values[idx] !== undefined ? values[idx] : null];
             });
-            // 用前一个值填充 null，使数据连续
             var filled = [];
             var lastValid = null;
             for (var i = 0; i < points.length; i++) {
@@ -1420,7 +1479,6 @@ HTML_PAGE = """
             timestamps: data.timestamps || [],
             series: data.series || {}
         };
-        // 重置zoom范围
         inst.currentZoom = [0, 100];
         updateChartWithSampling(deviceId);
 
@@ -1678,6 +1736,8 @@ HTML_PAGE = """
 
         container.innerHTML = '';
 
+        var batteryCalcMode = stats.battery_calc_mode || 'level';
+
         var html = '';
         for (var i = 0; i < deviceKeys.length; i++) {
             var clientId = deviceKeys[i];
@@ -1787,8 +1847,10 @@ HTML_PAGE = """
             if (netTypeDetail) netTypeDisplay += ' (' + netTypeDetail + ')';
             if (netSignalLevel) netTypeDisplay += ' 信号: ' + netSignalLevel;
 
+            var batteryValueHtml = batteryLevel + '% <span style="font-style:italic;color:#8899aa;font-size:11px;"> - 测算模式:' + batteryCalcMode + '</span>';
+
             var dataItems = [
-                { label: '🔋 电池', value: batteryLevel + '%', sub: batterySub, cls: batteryClass, module: 'battery' },
+                { label: '🔋 电池', value: batteryValueHtml, sub: batterySub, cls: batteryClass, module: 'battery' },
                 { label: '💾 内存', value: memoryUsedMB + ' / ' + memoryMB + ' MB', sub: '使用 ' + memoryPercent + '%', module: 'memory' },
                 { label: '💾 存储', value: storageUsedGB + ' / ' + storageGB + ' GB', sub: '使用 ' + storagePercent + '%', module: 'storage' },
                 { label: '📱 前台', value: fgTitle, sub: fgApp, module: 'foreground' },
@@ -2128,7 +2190,7 @@ async def main():
     host = CONFIG.get("host", "0.0.0.0")
 
     logger.info("=" * 80)
-    logger.info("📱 设备数据接收服务器 v18.2 (容量修正增强)")
+    logger.info("📱 设备数据接收服务器 v18.3 (多模式电池测算)")
     logger.info("=" * 80)
     logger.info(f"🌐 WebSocket: ws://{host}:{ws_port}")
     logger.info(f"🌐 Web界面: http://{host}:{web_port}")
@@ -2138,8 +2200,9 @@ async def main():
     logger.info("📝 设备配置: device_data/<deviceId>/historySet.ini")
     logger.info(f"📦 数据模块: {', '.join(DATA_MODULES)}")
     logger.info(f"📊 图表降采样目标点数: {CONFIG.get('chart_max_points', 800)}")
-    logger.info(f"📊 容量稳定阈值: {CONFIG.get('capacity_stability_threshold', 0.1)}%")
-    logger.info(f"📊 异常值过滤: ±{CONFIG.get('capacity_outlier_std_multiplier', 3.0)}×标准差")
+    logger.info(f"📊 电池测算模式: {CONFIG.get('calculate_battery_method', 'level')}")
+    logger.info(f"📊 容量稳定阈值: {CONFIG.get('calculate_battery_threshold', 0.1)}%")
+    logger.info(f"📊 异常值过滤: ±{CONFIG.get('calculate_battery_outlier_std_multiplier', 3.0)}×标准差")
     logger.info("📄 静态资源: /static/echarts.min.js")
     logger.info("💡 在终端输入 .help 查看命令")
     logger.info("=" * 80)

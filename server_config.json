@@ -18,7 +18,8 @@
         "memory",
         "storage"
     ],
-    "chart_max_points": 800,
-    "capacity_stability_threshold": 0.1,
-    "capacity_outlier_std_multiplier": 3.0
+    "chart_max_points": 250,
+    "calculate_battery_threshold": 0.1,
+    "calculate_battery_outlier_std_multiplier": 3.0,
+    "calculate_battery_method": "all"
 }
