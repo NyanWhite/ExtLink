@@ -8,18 +8,24 @@
     "ping_timeout": 60,
     "save_history": false,
     "history_length": "7d",
-    "data_modules": [
-        "battery",
-        "network",
-        "foreground",
-        "screen",
-        "sensors",
-        "location",
-        "memory",
-        "storage"
-    ],
+    "data_modules": ["battery","network","foreground","screen","sensors","location","memory","storage"],
     "chart_max_points": 250,
     "calculate_battery_threshold": 0.1,
     "calculate_battery_outlier_std_multiplier": 3.0,
-    "calculate_battery_method": "all"
+    "calculate_battery_method": ["level","capacity","voltage"],
+    "device_config": {
+    "updateInterval": 1,
+    "collectBasicInfo": true,
+    "collectBattery": true,
+    "collectForegroundApp": true,
+    "collectMemory": true,
+    "collectScreenState": true,
+    "collectStorageInfo": true,
+    "collectCpuInfo": true,
+    "collectLocation": true,
+    "collectSensor": true,
+    "collectProcesses": true,
+    "collectPackages": true,
+    "collectNetwork": true
+  }
 }

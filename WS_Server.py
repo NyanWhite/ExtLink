@@ -1,7 +1,7 @@
 # ws_server.py
 # 模块化存储 + 历史记录滑动窗口 + 可配置模块 + 多指标折线图
-# 电池速率算法：支持 capacity / voltage / level / all 多种测算模式
-# 配置项：calculate_battery_method, calculate_battery_threshold, calculate_battery_outlier_std_multiplier
+# 电池速率算法：支持 capacity / voltage / level 多种测算模式，可组合（数组形式）
+# 配置项：calculate_battery_method 现为数组，如 ["level","capacity","voltage"]
 
 import asyncio
 import json
@@ -28,36 +28,29 @@ logger = logging.getLogger(__name__)
 
 # ==================== 配置文件 ====================
 CONFIG_FILE = "server_config.json"
-DEFAULT_CONFIG = {
-    "ws_port": 91,
-    "web_port": 80,
-    "host": "0.0.0.0",
-    "data_dir": "device_data",
-    "log_level": 0,
-    "ping_interval": 30,
-    "ping_timeout": 60,
-    "save_history": False,
-    "history_length": "1mo",
-    "data_modules": [
-        "battery",
-        "network",
-        "foreground",
-        "screen",
-        "sensors",
-        "location",
-        "memory",
-        "storage"
-    ],
-    "chart_max_points": 800,
-    "calculate_battery_threshold": 0.1,
-    "calculate_battery_outlier_std_multiplier": 3.0,
-    "calculate_battery_method": "level"
-}
+
+# 必需的配置键（必须存在于配置文件中，无默认值）
+REQUIRED_KEYS = [
+    "ws_port",
+    "web_port",
+    "host",
+    "data_dir",
+    "log_level",
+    "ping_interval",
+    "ping_timeout",
+    "save_history",
+    "history_length",
+    "data_modules",
+    "chart_max_points",
+    "calculate_battery_threshold",
+    "calculate_battery_outlier_std_multiplier",
+    "calculate_battery_method"
+]
 
 
 def parse_history_length(length_str: str) -> int:
     if not length_str:
-        return 3600
+        raise ValueError("history_length 不能为空")
     length_str = length_str.strip().lower()
     try:
         if length_str.endswith('s'):
@@ -73,7 +66,7 @@ def parse_history_length(length_str: str) -> int:
         else:
             return int(length_str)
     except ValueError:
-        return 3600
+        raise ValueError(f"无效的 history_length 格式: {length_str}")
 
 
 def load_config():
@@ -84,18 +77,34 @@ def load_config():
             config = json.load(f)
     except json.JSONDecodeError as e:
         raise ValueError(f"配置文件 {CONFIG_FILE} 格式错误: {e}")
-    for key in DEFAULT_CONFIG:
-        if key not in config:
-            logger.warning(f"配置项 '{key}' 缺失，使用默认值: {DEFAULT_CONFIG[key]}")
-            config[key] = DEFAULT_CONFIG[key]
-    if not isinstance(config.get('data_modules'), list):
-        config['data_modules'] = DEFAULT_CONFIG['data_modules']
+
+    # 检查所有必需键是否存在
+    missing_keys = [key for key in REQUIRED_KEYS if key not in config]
+    if missing_keys:
+        raise KeyError(f"配置文件缺少必需键: {', '.join(missing_keys)}")
+
+    # 验证 calculate_battery_method 必须为列表
+    if not isinstance(config["calculate_battery_method"], list):
+        raise TypeError("calculate_battery_method 必须为数组 (例如 ['level','capacity','voltage'])")
+    if not config["calculate_battery_method"]:
+        raise ValueError("calculate_battery_method 不能为空数组")
+
+    # 验证 data_modules 必须为列表
+    if not isinstance(config["data_modules"], list) or not config["data_modules"]:
+        raise TypeError("data_modules 必须为非空数组")
+
+    # 可选：验证 device_config（如果存在则必须是字典，否则不处理）
+    if "device_config" in config and not isinstance(config["device_config"], dict):
+        raise TypeError("device_config 必须为字典对象")
+
     return config
 
 
 def set_log_level(level_code: int):
     level_map = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING, 3: logging.ERROR}
-    level = level_map.get(level_code, logging.DEBUG)
+    level = level_map.get(level_code)
+    if level is None:
+        raise ValueError(f"无效的 log_level: {level_code}，允许 0-3")
     logging.getLogger().setLevel(level)
     logger.info(f"日志级别设置为: {logging.getLevelName(level)} (代码 {level_code})")
 
@@ -103,22 +112,22 @@ def set_log_level(level_code: int):
 # 加载配置
 try:
     CONFIG = load_config()
-except (FileNotFoundError, ValueError) as e:
-    logger.error(f"配置加载失败: {e}")
+except (FileNotFoundError, ValueError, KeyError, TypeError) as e:
+    logger.error(f"❌ 配置加载失败: {e}")
     sys.exit(1)
 
-set_log_level(CONFIG.get("log_level", 0))
+set_log_level(CONFIG["log_level"])
 
-DATA_MODULES = CONFIG.get('data_modules', DEFAULT_CONFIG['data_modules'])
+DATA_MODULES = CONFIG["data_modules"]
 
-DATA_DIR = CONFIG.get("data_dir", "device_data")
+DATA_DIR = CONFIG["data_dir"]
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
     logger.info(f"📁 数据存储目录: {DATA_DIR}")
     logger.info(f"📦 数据模块: {', '.join(DATA_MODULES)}")
 except Exception as e:
     logger.error(f"❌ 创建数据目录失败: {e}")
-    DATA_DIR = "."
+    sys.exit(1)
 
 
 class DeviceDataServer:
@@ -148,7 +157,7 @@ class DeviceDataServer:
         self.history_loaded: Set[str] = set()
 
         # 用于 capacity/voltage 模式的最新两点数据
-        self.battery_readings: Dict[str, List[Dict]] = {}  # 每个设备保存最近2条记录
+        self.battery_readings: Dict[str, List[Dict]] = {}
 
     async def start(self):
         if self.running:
@@ -158,10 +167,10 @@ class DeviceDataServer:
         self.stop_event.clear()
         self.running = True
 
-        ws_port = CONFIG.get("ws_port", 91)
-        host = CONFIG.get("host", "0.0.0.0")
-        ping_interval = CONFIG.get("ping_interval", 30)
-        ping_timeout = CONFIG.get("ping_timeout", 60)
+        ws_port = CONFIG["ws_port"]
+        host = CONFIG["host"]
+        ping_interval = CONFIG["ping_interval"]
+        ping_timeout = CONFIG["ping_timeout"]
 
         try:
             self.websocket_server = await websockets.serve(
@@ -251,12 +260,17 @@ class DeviceDataServer:
         if CONFIG.get('save_history', False):
             self._load_battery_history_rates(client_id)
 
+        # 发送欢迎消息，并附带设备采集配置（如果存在）
+        welcome_msg = {
+            "type": "welcome",
+            "timestamp": int(time.time() * 1000),
+            "message": "连接成功! 等待数据接收..."
+        }
+        if "device_config" in CONFIG:
+            welcome_msg["config"] = CONFIG["device_config"]
+
         try:
-            await websocket.send(json.dumps({
-                "type": "welcome",
-                "timestamp": int(time.time() * 1000),
-                "message": "连接成功! 等待数据接收..."
-            }))
+            await websocket.send(json.dumps(welcome_msg))
         except:
             pass
 
@@ -316,7 +330,6 @@ class DeviceDataServer:
                 volt = battery.get('voltage')
                 ts = data.get('timestamp', int(time.time() * 1000))
                 if cap is not None or volt is not None:
-                    # 保留最近2个读数
                     readings = self.battery_readings.setdefault(client_id, [])
                     readings.append({'timestamp': ts, 'capacity': cap, 'voltage': volt})
                     if len(readings) > 2:
@@ -542,27 +555,18 @@ class DeviceDataServer:
     # ========== 容量/电压 稳定段提取（通用） ==========
     @staticmethod
     def _extract_stable_value(entries: List[Tuple[int, int, Optional[float]]],
-                              value_key: str,  # 'capacity' or 'voltage'
+                              value_key: str,
                               stability_threshold: float,
                               outlier_std_multiplier: float) -> Tuple[Optional[float], Optional[float]]:
-        """
-        从历史充电数据中提取稳定最大值和最小值
-        参数:
-            entries: [(timestamp, level, value), ...]  (value 对应 capacity 或 voltage)
-            返回: (stable_max, min_val) 或 (None, None)
-        """
         if len(entries) < 10:
             return None, None
 
-        # 提取所有有效值
         values = [v for _, _, v in entries if v is not None and v > 0]
         if len(values) < 5:
             return None, None
 
-        # 按时间排序
         sorted_entries = sorted(entries, key=lambda x: x[0])
 
-        # 分段：检测充电连续性（间隔 > 60秒 视为新段）
         segments = []
         current_seg = []
         last_ts = None
@@ -586,7 +590,6 @@ class DeviceDataServer:
             if len(seg) < 3:
                 continue
 
-            # 用中位数 ± N*标准差 过滤异常值
             median = statistics.median(seg)
             if len(seg) >= 4:
                 try:
@@ -616,7 +619,6 @@ class DeviceDataServer:
         if not stable_segments:
             return None, None
 
-        # 取众数（或平均）
         counter = Counter(stable_segments)
         most_common, count = counter.most_common(1)[0]
         if len(counter) <= 2:
@@ -624,7 +626,6 @@ class DeviceDataServer:
         else:
             stable_max = most_common
 
-        # 最小值：用相同方法过滤异常低值
         all_vals = values
         median_all = statistics.median(all_vals)
         if len(all_vals) >= 4:
@@ -646,7 +647,6 @@ class DeviceDataServer:
 
     # ---------- 电池速率计算 ----------
     def _load_battery_history_rates(self, client_id: str):
-        """从历史数据中加载并计算电池速率参考值（用于各种模式）"""
         if client_id in self.history_loaded:
             return
 
@@ -660,7 +660,7 @@ class DeviceDataServer:
         target_file = history_file_gz if os.path.exists(history_file_gz) else history_file
         open_func = gzip.open if target_file.endswith('.gz') else open
 
-        entries = []  # (timestamp, level, capacity, voltage, charging)
+        entries = []
         try:
             with open_func(target_file, 'rt', encoding='utf-8') as f:
                 for line in f:
@@ -690,10 +690,8 @@ class DeviceDataServer:
             self.history_loaded.add(client_id)
             return
 
-        # 按时间排序
         entries.sort(key=lambda x: x[0])
 
-        # ---- 计算 level 历史速率（用于 level 模式） ----
         max_entry = max(entries, key=lambda x: x[1])
         min_entry = min(entries, key=lambda x: x[1])
 
@@ -715,12 +713,11 @@ class DeviceDataServer:
         else:
             rate = None
 
-        # ---- 提取充电状态下的容量和电压稳定值 ----
         charging_entries = [(ts, level, cap) for ts, level, cap, volt, chg in entries if chg and cap is not None and cap > 0]
         charging_volt_entries = [(ts, level, volt) for ts, level, cap, volt, chg in entries if chg and volt is not None and volt > 0]
 
-        stability_threshold = CONFIG.get('calculate_battery_threshold', 0.1)
-        outlier_multiplier = CONFIG.get('calculate_battery_outlier_std_multiplier', 3.0)
+        stability_threshold = CONFIG["calculate_battery_threshold"]
+        outlier_multiplier = CONFIG["calculate_battery_outlier_std_multiplier"]
 
         cap_stable, cap_min = self._extract_stable_value(
             charging_entries, 'capacity', stability_threshold, outlier_multiplier
@@ -729,9 +726,8 @@ class DeviceDataServer:
             charging_volt_entries, 'voltage', stability_threshold, outlier_multiplier
         )
 
-        # 存储
         self.battery_history_rates[client_id] = {
-            'level_rate': rate,           # 历史 level 速率（可能为 None）
+            'level_rate': rate,
             'cap_stable': cap_stable,
             'cap_min': cap_min,
             'volt_stable': volt_stable,
@@ -751,12 +747,10 @@ class DeviceDataServer:
     # ---------- 各模式速率计算 ----------
     def _calculate_battery_rate_level(self, client_id: str) -> Optional[float]:
         """原有 level 模式复合算法（历史极值 + RAM段 + 电流回退）"""
-        # 1) 历史模式（容量修正）
         if CONFIG.get('save_history', False):
             hist = self.battery_history_rates.get(client_id)
             if hist and hist.get('level_rate') is not None:
                 rate = hist['level_rate']
-                # 容量修正（如果可用）
                 ref_cap = hist.get('cap_stable')
                 if ref_cap is not None and ref_cap > 0:
                     battery = self._get_current_battery_data(client_id)
@@ -768,7 +762,6 @@ class DeviceDataServer:
                         return adjusted
                 return rate
 
-        # 2) RAM段模式
         last_charging = self.battery_last_charging.get(client_id)
         if last_charging is True:
             seg = self.battery_charge_segment.get(client_id, [])
@@ -802,7 +795,6 @@ class DeviceDataServer:
                         rate2 = 50 if rate2 > 0 else -50
                     return rate2
 
-        # 3) 电流回退
         return self._calculate_rate_from_current(client_id)
 
     def _calculate_rate_from_current(self, client_id: str) -> Optional[float]:
@@ -821,7 +813,6 @@ class DeviceDataServer:
             return -percent_per_min
 
     def _calculate_rate_capacity(self, client_id: str) -> Optional[float]:
-        """基于容量变化率（μAh/min）除以容量范围得到 %/min"""
         hist = self.battery_history_rates.get(client_id)
         if not hist:
             return None
@@ -854,7 +845,6 @@ class DeviceDataServer:
         return percent_per_min
 
     def _calculate_rate_voltage(self, client_id: str) -> Optional[float]:
-        """基于电压变化率（mV/min）除以电压范围得到 %/min"""
         hist = self.battery_history_rates.get(client_id)
         if not hist:
             return None
@@ -891,28 +881,25 @@ class DeviceDataServer:
         return data.get('battery', {})
 
     def _calculate_battery_rate(self, client_id: str) -> Optional[float]:
-        """根据配置的模式计算电池速率"""
-        method = CONFIG.get('calculate_battery_method', 'level')
-        if method == 'level':
-            return self._calculate_battery_rate_level(client_id)
-        elif method == 'capacity':
-            return self._calculate_rate_capacity(client_id)
-        elif method == 'voltage':
-            return self._calculate_rate_voltage(client_id)
-        elif method == 'all':
-            rates = []
-            r1 = self._calculate_battery_rate_level(client_id)
-            r2 = self._calculate_rate_capacity(client_id)
-            r3 = self._calculate_rate_voltage(client_id)
-            for r in (r1, r2, r3):
-                if r is not None:
-                    rates.append(r)
-            if rates:
-                return sum(rates) / len(rates)
+        """根据配置的数组计算各模式并取平均"""
+        methods = CONFIG["calculate_battery_method"]  # 列表，如 ['level','capacity']
+        rates = []
+        for method in methods:
+            if method == 'level':
+                r = self._calculate_battery_rate_level(client_id)
+            elif method == 'capacity':
+                r = self._calculate_rate_capacity(client_id)
+            elif method == 'voltage':
+                r = self._calculate_rate_voltage(client_id)
             else:
-                return None
-        else:
-            return self._calculate_battery_rate_level(client_id)
+                logger.warning(f"未知的电池测算模式: {method}，已忽略")
+                continue
+            if r is not None:
+                rates.append(r)
+        if not rates:
+            return None
+        # 取平均
+        return sum(rates) / len(rates)
 
     # ---------- 统计 ----------
     def get_device_stats(self) -> Dict[str, Any]:
@@ -922,7 +909,7 @@ class DeviceDataServer:
             "active_devices": len([c for c, t in self.device_last_seen.items() if now - t < 300]),
             "total_messages": self.total_messages,
             "devices": {},
-            "battery_calc_mode": CONFIG.get('calculate_battery_method', 'level')
+            "battery_calc_mode": CONFIG["calculate_battery_method"]  # 返回数组
         }
 
         for client_id, data in self.device_data.items():
@@ -1089,7 +1076,7 @@ class DeviceDataServer:
         )
 
 
-# ==================== HTML页面 ====================
+# ==================== HTML页面（完整） ====================
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -2085,8 +2072,8 @@ HTML_PAGE = """
 
 
 def get_html():
-    ws_port = CONFIG.get("ws_port", 91)
-    max_points = CONFIG.get("chart_max_points", 800)
+    ws_port = CONFIG["ws_port"]
+    max_points = CONFIG["chart_max_points"]
     html = HTML_PAGE.replace("{{WS_PORT}}", str(ws_port))
     html = html.replace("{{MAX_POINTS}}", str(max_points))
     return html
@@ -2152,12 +2139,10 @@ async def handle_reload(server: DeviceDataServer):
     try:
         new_config = load_config()
         CONFIG = new_config
-        log_level = CONFIG.get('log_level', 0)
-        set_log_level(log_level)
-        DATA_MODULES = CONFIG.get('data_modules', DEFAULT_CONFIG['data_modules'])
+        set_log_level(CONFIG["log_level"])
+        DATA_MODULES = CONFIG["data_modules"]
         logger.info("✅ 配置文件已重新加载")
         logger.info(f"📦 数据模块: {', '.join(DATA_MODULES)}")
-        # 重置历史加载状态，以便下次连接时重新加载（使用新配置）
         server.history_loaded.clear()
         server.battery_history_rates.clear()
         logger.info("🔄 电池历史缓存已重置")
@@ -2185,12 +2170,12 @@ async def handle_log_level(level: int):
 async def main():
     global need_restart
     server = DeviceDataServer()
-    ws_port = CONFIG.get("ws_port", 91)
-    web_port = CONFIG.get("web_port", 80)
-    host = CONFIG.get("host", "0.0.0.0")
+    ws_port = CONFIG["ws_port"]
+    web_port = CONFIG["web_port"]
+    host = CONFIG["host"]
 
     logger.info("=" * 80)
-    logger.info("📱 设备数据接收服务器 v18.3 (多模式电池测算)")
+    logger.info("📱 设备数据接收服务器 v18.4 (多模式电池测算 - 数组配置)")
     logger.info("=" * 80)
     logger.info(f"🌐 WebSocket: ws://{host}:{ws_port}")
     logger.info(f"🌐 Web界面: http://{host}:{web_port}")
@@ -2199,10 +2184,10 @@ async def main():
     logger.info("📝 全局配置: server_config.json")
     logger.info("📝 设备配置: device_data/<deviceId>/historySet.ini")
     logger.info(f"📦 数据模块: {', '.join(DATA_MODULES)}")
-    logger.info(f"📊 图表降采样目标点数: {CONFIG.get('chart_max_points', 800)}")
-    logger.info(f"📊 电池测算模式: {CONFIG.get('calculate_battery_method', 'level')}")
-    logger.info(f"📊 容量稳定阈值: {CONFIG.get('calculate_battery_threshold', 0.1)}%")
-    logger.info(f"📊 异常值过滤: ±{CONFIG.get('calculate_battery_outlier_std_multiplier', 3.0)}×标准差")
+    logger.info(f"📊 图表降采样目标点数: {CONFIG['chart_max_points']}")
+    logger.info(f"📊 电池测算模式: {CONFIG['calculate_battery_method']}")
+    logger.info(f"📊 容量稳定阈值: {CONFIG['calculate_battery_threshold']}%")
+    logger.info(f"📊 异常值过滤: ±{CONFIG['calculate_battery_outlier_std_multiplier']}×标准差")
     logger.info("📄 静态资源: /static/echarts.min.js")
     logger.info("💡 在终端输入 .help 查看命令")
     logger.info("=" * 80)

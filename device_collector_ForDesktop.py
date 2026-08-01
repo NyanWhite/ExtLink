@@ -1,5 +1,5 @@
-# device_collector.py
-# Windows 设备信息收集器 - 支持 WebSocket 上报（无IP版本）
+# device_collector_ForDesktop.py
+# Windows 设备信息收集器 - 支持 WebSocket 上报（配置由服务器动态下发）
 
 import asyncio
 import json
@@ -24,20 +24,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== 配置 ====================
-CONFIG = {
-    "deviceId": None,  # 将在初始化时设置
-    "wsServer": "localhost:91",
-    "updateInterval": 1,  # 数据上传间隔（秒）
-    "collectBasicInfo": True,
-    "collectBattery": True,
-    "collectForegroundApp": True,
-    "collectMemory": True,
-    "collectCpuInfo": True,
-    "collectStorageInfo": True,
-    "collectNetwork": True,
-    "collectProcesses": True
+# ==================== 固定配置（仅 deviceId 和 wsServer） ====================
+DEVICE_ID = None  # 将在初始化时设置
+FIXED_CONFIG = {
+    "wsServer": "localhost:91"
+    # deviceId 动态设置
 }
+
+# 最终配置（由固定配置 + 服务器下发合并而成）
+CONFIG = {}
+
+
+def init_config():
+    """初始化配置：设置固定值，并赋予默认采集参数（等待服务器下发更新）"""
+    global CONFIG, DEVICE_ID
+    DEVICE_ID = get_device_id()
+    CONFIG = {
+        "deviceId": DEVICE_ID,
+        "wsServer": FIXED_CONFIG["wsServer"],
+        # 默认采集参数（后续可由服务器覆盖）
+        "updateInterval": 1,
+        "collectBasicInfo": True,
+        "collectBattery": True,
+        "collectForegroundApp": True,
+        "collectMemory": True,
+        "collectCpuInfo": True,
+        "collectStorageInfo": True,
+        "collectNetwork": True,
+        "collectProcesses": True
+    }
+
 
 # ==================== 获取设备信息 ====================
 def get_device_id():
@@ -47,12 +63,14 @@ def get_device_id():
     except:
         return "WINDOWS_" + str(int(time.time()))
 
+
 def get_windows_version():
     """获取Windows版本"""
     try:
         return platform.version()
     except:
         return "Unknown"
+
 
 def get_os_info():
     """获取操作系统信息"""
@@ -73,6 +91,7 @@ def get_os_info():
             "processor": "Unknown"
         }
 
+
 def get_system_manufacturer():
     """获取系统制造商"""
     try:
@@ -82,6 +101,7 @@ def get_system_manufacturer():
     except:
         return "Unknown"
 
+
 def get_system_model():
     """获取系统型号"""
     try:
@@ -90,6 +110,7 @@ def get_system_model():
             return item.Model or "Unknown"
     except:
         return "Unknown"
+
 
 def get_screen_info():
     """获取屏幕信息"""
@@ -105,6 +126,7 @@ def get_screen_info():
         }
     except:
         return {"width": -1, "height": -1, "density": -1}
+
 
 # ==================== 电池信息 ====================
 def get_battery_info():
@@ -125,6 +147,7 @@ def get_battery_info():
         pass
     return result
 
+
 # ==================== 前台应用（Windows） ====================
 def get_foreground_app():
     """获取前台应用"""
@@ -132,16 +155,13 @@ def get_foreground_app():
         import ctypes
         from ctypes import wintypes
         
-        # Windows API 获取前台窗口
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         
-        # 获取前台窗口句柄
         hwnd = user32.GetForegroundWindow()
         if hwnd == 0:
             return {"packageName": "Unknown", "activity": "Unknown", "source": "none"}
         
-        # 获取窗口标题
         length = user32.GetWindowTextLengthW(hwnd)
         if length > 0:
             buff = ctypes.create_unicode_buffer(length + 1)
@@ -150,11 +170,9 @@ def get_foreground_app():
         else:
             window_title = "Unknown"
         
-        # 获取进程ID
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         
-        # 获取进程名称
         process_name = "Unknown"
         try:
             if pid.value > 0:
@@ -174,6 +192,7 @@ def get_foreground_app():
         logger.debug(f"获取前台应用失败: {e}")
         return {"packageName": "Unknown", "activity": "Unknown", "source": "error"}
 
+
 # ==================== 内存信息 ====================
 def get_memory_info():
     """获取内存信息"""
@@ -188,6 +207,7 @@ def get_memory_info():
     except:
         return {"total": -1, "used": -1, "available": -1, "usagePercent": -1}
 
+
 # ==================== CPU信息 ====================
 def get_cpu_info():
     """获取CPU信息"""
@@ -199,7 +219,6 @@ def get_cpu_info():
             "usage": psutil.cpu_percent(interval=0.5)
         }
         
-        # 尝试获取CPU型号
         try:
             output = subprocess.check_output(
                 "wmic cpu get name", 
@@ -217,6 +236,7 @@ def get_cpu_info():
     except:
         return {"cores": -1, "model": "Unknown", "usage": -1}
 
+
 # ==================== 存储信息 ====================
 def get_storage_info():
     """获取存储信息（汇总所有磁盘）"""
@@ -228,7 +248,6 @@ def get_storage_info():
         
         for partition in psutil.disk_partitions():
             try:
-                # 只处理可读写的物理磁盘（跳过光驱、虚拟盘等）
                 if 'cdrom' in partition.opts or 'removable' in partition.opts:
                     continue
                 
@@ -249,11 +268,9 @@ def get_storage_info():
             except:
                 pass
         
-        # 如果没有找到任何分区，返回默认值
         if not partitions:
             return {"total": -1, "used": -1, "available": -1, "usagePercent": -1, "partitions": []}
         
-        # 计算总使用百分比
         total_percent = 0
         if total_size > 0:
             total_percent = round((total_used / total_size) * 100, 1)
@@ -263,12 +280,13 @@ def get_storage_info():
             "used": total_used,
             "available": total_free,
             "usagePercent": total_percent,
-            "partitions": partitions,  # 保留分区详情供后续使用
+            "partitions": partitions,
             "partitionCount": len(partitions)
         }
     except Exception as e:
         logger.debug(f"获取存储信息失败: {e}")
         return {"total": -1, "used": -1, "available": -1, "usagePercent": -1, "partitions": []}
+
 
 # ==================== 网络信息 ====================
 class NetworkStats:
@@ -279,7 +297,6 @@ class NetworkStats:
         self.initialized = False
 
     def get_network_stats(self, interval_seconds):
-        """获取网络统计信息（不包含IP地址）"""
         result = {
             "type": "未知",
             "detail": "未获取",
@@ -301,21 +318,17 @@ class NetworkStats:
         }
         
         try:
-            # 获取网络接口信息
             net_io = psutil.net_io_counters()
             current_rx = net_io.bytes_recv
             current_tx = net_io.bytes_sent
             current_time = time.time()
             
-            # 获取网络连接状态
             try:
-                # 检查是否有网络连接
                 socket.create_connection(("8.8.8.8", 53), timeout=1)
                 result["isConnected"] = True
             except:
                 result["isConnected"] = False
             
-            # 尝试判断网络类型（WiFi/以太网）
             try:
                 adapters = psutil.net_if_stats()
                 wifi_found = False
@@ -339,13 +352,11 @@ class NetworkStats:
                     result["type"] = "已连接"
                     result["detail"] = "已连接"
             
-            # 总流量
             result["totalRx"] = current_rx
             result["totalTx"] = current_tx
             result["totalRxStr"] = format_bytes(current_rx)
             result["totalTxStr"] = format_bytes(current_tx)
             
-            # 计算间隔流量和速度
             if not self.initialized:
                 self.last_rx = current_rx
                 self.last_tx = current_tx
@@ -384,8 +395,8 @@ class NetworkStats:
             logger.debug(f"获取网络统计失败: {e}")
             return result
 
+
 def format_speed(bytes_per_second):
-    """格式化速度"""
     if bytes_per_second < 0:
         return "0 B/s"
     if bytes_per_second < 1024:
@@ -397,8 +408,8 @@ def format_speed(bytes_per_second):
     else:
         return f"{bytes_per_second / 1024 / 1024 / 1024:.1f} GB/s"
 
+
 def format_bytes(bytes_val):
-    """格式化字节数"""
     if bytes_val < 0:
         return "0 B"
     if bytes_val < 1024:
@@ -410,9 +421,9 @@ def format_bytes(bytes_val):
     else:
         return f"{bytes_val / 1024 / 1024 / 1024:.2f} GB"
 
+
 # ==================== 进程信息 ====================
 def get_top_processes():
-    """获取Top进程"""
     try:
         processes = []
         for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
@@ -428,36 +439,37 @@ def get_top_processes():
             except:
                 pass
         
-        # 按CPU使用率排序
         processes.sort(key=lambda x: x['cpuPercent'], reverse=True)
-        return processes[:10]  # 返回前10个
+        return processes[:10]
     except:
         return []
+
 
 # ==================== 数据收集器 ====================
 class DeviceCollector:
     def __init__(self):
-        self.device_id = get_device_id()
+        init_config()  # 初始化 CONFIG
+        
+        self.device_id = CONFIG["deviceId"]
         self.network_stats = NetworkStats()
         self.send_count = 0
         self.is_running = True
         self.ws = None
         self.ws_connected = False
-        
-        # 初始化配置
-        CONFIG["deviceId"] = self.device_id
+        self.config_received = False
+        self.send_task = None  # 当前定时发送任务
         
         # 收集固定设备信息
         self.device_info = self._collect_device_info()
         
         logger.info("=" * 60)
-        logger.info(f"📱 Windows 设备收集器")
+        logger.info(f"📱 Windows 设备收集器 (动态配置)")
         logger.info("=" * 60)
         logger.info(f"📋 设备ID: {self.device_id}")
         logger.info(f"🏭 制造商: {self.device_info.get('manufacturer', 'Unknown')}")
         logger.info(f"📦 系统: {self.device_info.get('os', {}).get('system', 'Unknown')} {self.device_info.get('os', {}).get('release', 'Unknown')}")
         logger.info(f"📐 屏幕: {self.device_info.get('screenWidth', -1)}x{self.device_info.get('screenHeight', -1)}")
-        logger.info(f"⏱️ 上传间隔: {CONFIG['updateInterval']}秒")
+        logger.info(f"⏱️ 上传间隔: {CONFIG.get('updateInterval', 1)}秒 (默认，等待服务器下发)")
         logger.info("=" * 60)
 
     def _collect_device_info(self):
@@ -477,41 +489,43 @@ class DeviceCollector:
             "windowsVersion": get_windows_version()
         }
 
+    def _update_config(self, server_config: Dict):
+        """更新配置（只更新非固定字段）"""
+        for k, v in server_config.items():
+            if k not in ("deviceId", "wsServer"):
+                CONFIG[k] = v
+        logger.info(f"✅ 配置已更新: updateInterval={CONFIG.get('updateInterval')}, "
+                    f"collectBattery={CONFIG.get('collectBattery')}, "
+                    f"collectNetwork={CONFIG.get('collectNetwork')} ...")
+
     def collect_all_data(self):
-        """收集所有数据"""
+        """收集所有数据（使用当前 CONFIG）"""
         data = {
             "deviceId": CONFIG["deviceId"],
             "timestamp": int(time.time() * 1000),
-            "permissionLevel": 2  # Windows 通常有较高权限
+            "permissionLevel": 2
         }
 
-        # 基础设备信息
-        if CONFIG["collectBasicInfo"]:
+        if CONFIG.get("collectBasicInfo", True):
             data["device"] = self.device_info
 
-        # 电池信息
-        if CONFIG["collectBattery"]:
+        if CONFIG.get("collectBattery", True):
             data["battery"] = get_battery_info()
 
-        # 前台应用
-        if CONFIG["collectForegroundApp"]:
+        if CONFIG.get("collectForegroundApp", True):
             data["foreground"] = get_foreground_app()
 
-        # 内存信息
-        if CONFIG["collectMemory"]:
+        if CONFIG.get("collectMemory", True):
             data["memory"] = get_memory_info()
 
-        # CPU信息
-        if CONFIG["collectCpuInfo"]:
+        if CONFIG.get("collectCpuInfo", True):
             data["cpu"] = get_cpu_info()
 
-        # 存储信息
-        if CONFIG["collectStorageInfo"]:
+        if CONFIG.get("collectStorageInfo", True):
             data["storage"] = get_storage_info()
 
-        # 网络信息（不包含IP）
-        if CONFIG["collectNetwork"]:
-            net_stats = self.network_stats.get_network_stats(CONFIG["updateInterval"])
+        if CONFIG.get("collectNetwork", True):
+            net_stats = self.network_stats.get_network_stats(CONFIG.get("updateInterval", 1))
             data["network"] = {
                 "type": net_stats["type"],
                 "detail": net_stats["detail"],
@@ -534,11 +548,41 @@ class DeviceCollector:
                 "totalTxStr": net_stats["totalTxStr"]
             }
 
-        # 进程信息
-        if CONFIG["collectProcesses"]:
+        if CONFIG.get("collectProcesses", True):
             data["processes"] = get_top_processes()
 
         return data
+
+    async def _restart_sender(self):
+        """重启定时发送任务（当配置更新时调用）"""
+        if self.send_task and not self.send_task.done():
+            self.send_task.cancel()
+            try:
+                await self.send_task
+            except asyncio.CancelledError:
+                pass
+        if self.is_running and self.ws_connected:
+            self.send_task = asyncio.create_task(self._send_loop())
+
+    async def _send_loop(self):
+        """定时发送循环"""
+        while self.is_running and self.ws_connected:
+            try:
+                data = self.collect_all_data()
+                data["dataType"] = "diff"
+                await self.ws.send(json.dumps(data))
+                self.send_count += 1
+                if self.send_count % 20 == 0:
+                    logger.info(f"📤 已发送 {self.send_count} 次")
+            except Exception as e:
+                logger.error(f"❌ 发送失败: {e}")
+                self.ws_connected = False
+                asyncio.create_task(self.connect_websocket())
+                break
+            
+            # 等待下一个间隔（动态获取间隔，可能被配置更新改变）
+            interval = CONFIG.get("updateInterval", 1)
+            await asyncio.sleep(interval)
 
     async def connect_websocket(self):
         """连接WebSocket"""
@@ -565,7 +609,7 @@ class DeviceCollector:
             self.ws_connected = True
             logger.info("✅ WebSocket 已连接")
 
-            # 发送初始数据
+            # 发送初始数据（full），等待配置
             try:
                 data = self.collect_all_data()
                 data["dataType"] = "full"
@@ -590,9 +634,14 @@ class DeviceCollector:
         try:
             async for message in self.ws:
                 try:
-                    data = json.loads(message)
-                    # 处理服务器消息（如果有）
-                    pass
+                    msg = json.loads(message)
+                    if msg.get("type") == "welcome":
+                        if "config" in msg:
+                            self._update_config(msg["config"])
+                            self.config_received = True
+                            # 配置已更新，重启定时发送
+                            await self._restart_sender()
+                    # 其他消息忽略
                 except:
                     pass
         except websockets.exceptions.ConnectionClosed:
@@ -604,30 +653,6 @@ class DeviceCollector:
         except Exception as e:
             logger.error(f"❌ 接收错误: {e}")
             self.ws_connected = False
-
-    async def send_periodic_data(self):
-        """定期发送数据"""
-        if not self.is_running:
-            return
-
-        if self.ws_connected and self.ws:
-            try:
-                data = self.collect_all_data()
-                data["dataType"] = "diff"
-                await self.ws.send(json.dumps(data))
-                self.send_count += 1
-                if self.send_count % 20 == 0:
-                    logger.info(f"📤 已发送 {self.send_count} 次")
-            except Exception as e:
-                logger.error(f"❌ 发送失败: {e}")
-                self.ws_connected = False
-                asyncio.create_task(self.connect_websocket())
-
-        if self.is_running:
-            asyncio.get_event_loop().call_later(
-                CONFIG["updateInterval"],
-                lambda: asyncio.create_task(self.send_periodic_data())
-            )
 
     def print_data(self):
         """打印当前数据（不显示IP）"""
@@ -657,11 +682,14 @@ class DeviceCollector:
         """停止收集器"""
         logger.info("🛑 停止收集器...")
         self.is_running = False
+        if self.send_task and not self.send_task.done():
+            self.send_task.cancel()
         if self.ws:
             try:
                 asyncio.create_task(self.ws.close())
             except:
                 pass
+
 
 # ==================== 主程序 ====================
 async def main():
@@ -675,13 +703,10 @@ async def main():
     logger.info("\n🔗 启动 WebSocket...")
     await collector.connect_websocket()
     
-    # 启动定期发送
-    if collector.is_running:
-        logger.info(f"⏱️ 开始定期发送 (间隔 {CONFIG['updateInterval']} 秒)...")
-        asyncio.get_event_loop().call_later(
-            CONFIG["updateInterval"],
-            lambda: asyncio.create_task(collector.send_periodic_data())
-        )
+    # 启动定期发送（先使用默认配置，等待服务器下发后重启）
+    if collector.is_running and collector.ws_connected:
+        logger.info(f"⏱️ 开始定期发送 (初始间隔 {CONFIG.get('updateInterval', 1)} 秒)...")
+        collector.send_task = asyncio.create_task(collector._send_loop())
     
     logger.info("\n" + "=" * 60)
     logger.info("✅ 已启动!")
@@ -689,7 +714,6 @@ async def main():
     logger.info("=" * 60)
     
     try:
-        # 保持运行
         while collector.is_running:
             await asyncio.sleep(1)
     except KeyboardInterrupt:
